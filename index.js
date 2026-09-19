@@ -12,8 +12,13 @@ import "./database/connection.database.js";
 // ---- Rutas ----
 import authRouter from "./routes/auth.route.js";
 import empleadosRouter from "./routes/empleados.route.js";
-import usuariosRouter  from "./routes/usuarios.route.js";
-import camarasRouter   from "./routes/camaras.route.js";
+import usuariosRouter from "./routes/usuarios.route.js";
+import camarasRouter from "./routes/camaras.route.js";
+
+// ---- Bloque 3 · Catálogos de origen y producto ----
+import productoresRouter from "./routes/productores.route.js";
+import fincasRouter from "./routes/fincas.route.js";
+import skuRouter from "./routes/sku.route.js";
 
 dotenv.config();
 
@@ -75,22 +80,31 @@ const API = "/api/preenfrio";
 
 app.use(`${API}/auth`, authRouter);
 
+// ---- Bloque 1 y 2 · Seguridad, personal e infraestructura fría ----
+app.use(`${API}/empleados`, empleadosRouter);
+app.use(`${API}/usuarios`, usuariosRouter);
+app.use(`${API}/camaras`, camarasRouter);
+
+// ---- Bloque 3 · Catálogos de origen y producto ----
+// Alimentan el código de lote de 15 dígitos:
+//   fincas.zona      → letra inicial (A/B/C)
+//   productores      → 2 dígitos del código
+//   fincas           → 3 dígitos del código
+//   sku_pt.turno     → último dígito
+app.use(`${API}/productores`, productoresRouter);
+app.use(`${API}/fincas`, fincasRouter);
+app.use(`${API}/sku`, skuRouter);
+
 // ---- Pendientes por módulo (se irán agregando) ----
-app.use(`${API}/empleados`,     empleadosRouter);
-app.use(`${API}/usuarios`,      usuariosRouter);
-app.use(`${API}/camaras`,       camarasRouter);
-// app.use(`${API}/sku`,           skuRouter);
-// app.use(`${API}/productores`,   productoresRouter);
-// app.use(`${API}/fincas`,        fincasRouter);
-// app.use(`${API}/cedis`,         cedisRouter);
-// app.use(`${API}/transportes`,   transportesRouter);
-// app.use(`${API}/produccion`,    produccionRouter);
-// app.use(`${API}/recepciones`,   recepcionesRouter);
-// app.use(`${API}/ocupaciones`,   ocupacionesRouter);
-// app.use(`${API}/movimientos`,   movimientosRouter);
-// app.use(`${API}/despachos`,     despachosRouter);
-// app.use(`${API}/bloques`,       bloquesRouter);
-// app.use(`${API}/pulpeos`,       pulpeosRouter);
+// app.use(`${API}/cedis`,          cedisRouter);
+// app.use(`${API}/transportes`,    transportesRouter);
+// app.use(`${API}/produccion`,     produccionRouter);
+// app.use(`${API}/recepciones`,    recepcionesRouter);
+// app.use(`${API}/ocupaciones`,    ocupacionesRouter);
+// app.use(`${API}/movimientos`,    movimientosRouter);
+// app.use(`${API}/despachos`,      despachosRouter);
+// app.use(`${API}/bloques`,        bloquesRouter);
+// app.use(`${API}/pulpeos`,        pulpeosRouter);
 // app.use(`${API}/mantenimientos`, mantenimientosRouter);
 
 // Salud del servicio: sirve para verificar que responde sin tocar la BD.
