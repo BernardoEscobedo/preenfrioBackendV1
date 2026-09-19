@@ -11,6 +11,9 @@ import "./database/connection.database.js";
 
 // ---- Rutas ----
 import authRouter from "./routes/auth.route.js";
+import empleadosRouter from "./routes/empleados.route.js";
+import usuariosRouter  from "./routes/usuarios.route.js";
+import camarasRouter   from "./routes/camaras.route.js";
 
 dotenv.config();
 
@@ -73,9 +76,9 @@ const API = "/api/preenfrio";
 app.use(`${API}/auth`, authRouter);
 
 // ---- Pendientes por módulo (se irán agregando) ----
-// app.use(`${API}/empleados`,     empleadosRouter);
-// app.use(`${API}/usuarios`,      usuariosRouter);
-// app.use(`${API}/camaras`,       camarasRouter);
+app.use(`${API}/empleados`,     empleadosRouter);
+app.use(`${API}/usuarios`,      usuariosRouter);
+app.use(`${API}/camaras`,       camarasRouter);
 // app.use(`${API}/sku`,           skuRouter);
 // app.use(`${API}/productores`,   productoresRouter);
 // app.use(`${API}/fincas`,        fincasRouter);
