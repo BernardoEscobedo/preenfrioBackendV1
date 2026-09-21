@@ -1,45 +1,47 @@
 import { Router } from "express";
-import { FincasController } from "../controllers/fincas.controller.js";
+import { fincasController } from "../controllers/fincas.controller.js";
+import { validarFinca, validarIdFinca } from "../middlewares/fincas.middleware.js";
 import {
     verifyToken,
-    verifyCoordinador
+    verifyCoordinador,
+    verifyOperativo
 } from "../middlewares/jwt.middleware.js";
 
 const router = Router();
 
 // ============================================================================
-// FINCAS  ·  ver = operativo+  ·  crear/editar/baja = coordinador+
-// ----------------------------------------------------------------------------
-// Montaje en index.js:
-//     app.use(`${API}/fincas`, fincasRouter);
-// URL final: /api/preenfrio/fincas
+// FINCAS  ·  ver = operativo+ · crear/editar/baja = coordinador+
+// ============================================================================
+// Sin cargarAlcance: la finca es el ORIGEN de la fruta, no su destino.
 //
-// POR QUÉ LA ESCRITURA ES COORDINADOR+
-//   fincas.zona define la LETRA INICIAL del código de lote:
-//       1 → A (Chiapas) · 2 → B (Colima) · 3 → C (Tabasco) · otra → X
-//   Y codigo_finca aporta 3 de los 15 dígitos. Un error aquí corrompe la
-//   trazabilidad de toda la fruta de esa finca.
+// ESCRITURA en coordinador porque fincas.zona define la LETRA INICIAL del
+// código de lote (1→A Chiapas · 2→B Colima · 3→C Tabasco) y codigo_finca
+// aporta otros 3 dígitos. Un error aquí no avisa: los lotes salen mal y se
+// descubre semanas después, con fruta ya despachada.
 //
-// FILTROS DISPONIBLES EN EL GET
+// FILTROS DEL LISTADO
 //   ?id_productor=3   fincas de un productor (selects encadenados)
 //   ?zona=1           1=Chiapas · 2=Colima · 3=Tabasco
 //   ?estado=1         solo activas
 //   ?buscar=texto     código, nombre u organización
 // ============================================================================
 
-router.use(verifyToken);
+// ---- Consultas ----
+router.get("/", verifyToken, verifyOperativo, fincasController.getFincas);
 
-// ---------------------------------------------------------------- LECTURA
-router.get("/", FincasController.listar);
-router.get("/:id", FincasController.obtener);
+router.get("/:id", verifyToken, verifyOperativo, validarIdFinca, fincasController.getFincaById);
 
-// --------------------------------------------------------------- ESCRITURA
-router.post("/", verifyCoordinador, FincasController.crear);
-router.put("/:id", verifyCoordinador, FincasController.actualizar);
+// ---- Alta y edición ----
+// El controller verifica que el productor exista, esté activo y que el
+// código no se repita dentro de ese mismo productor
+router.post("/", verifyToken, verifyCoordinador, validarFinca, fincasController.createFinca);
 
-// Baja LÓGICA (estado = 0). produccion.id_finca sigue apuntando aquí.
-router.delete("/:id", verifyCoordinador, FincasController.darDeBaja);
+router.put("/:id", verifyToken, verifyCoordinador, validarIdFinca, validarFinca, fincasController.updateFinca);
 
-router.patch("/:id/reactivar", verifyCoordinador, FincasController.reactivar);
+// ---- Baja ----
+// Lógica (estado = 0): produccion.id_finca sigue apuntando aquí
+router.delete("/:id", verifyToken, verifyCoordinador, validarIdFinca, fincasController.bajaFinca);
+
+router.patch("/:id/reactivar", verifyToken, verifyCoordinador, validarIdFinca, fincasController.reactivarFinca);
 
 export default router;

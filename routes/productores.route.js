@@ -1,47 +1,51 @@
 import { Router } from "express";
-import { ProductoresController } from "../controllers/productores.controller.js";
+import { productoresController } from "../controllers/productores.controller.js";
+import {
+    validarProductor,
+    validarIdProductor
+} from "../middlewares/productores.middleware.js";
 import {
     verifyToken,
-    verifyCoordinador
+    verifyCoordinador,
+    verifyOperativo
 } from "../middlewares/jwt.middleware.js";
 
 const router = Router();
 
 // ============================================================================
-// PRODUCTORES  ·  ver = operativo+  ·  crear/editar/baja = coordinador+
-// ----------------------------------------------------------------------------
-// Las rutas se declaran con "/" porque el prefijo lo pone index.js:
-//     app.use(`${API}/productores`, productoresRouter);
-// URL final: /api/preenfrio/productores
+// PRODUCTORES  ·  ver = operativo+ · crear/editar/baja = coordinador+
+// ============================================================================
+// Rutas REST: el prefijo lo pone index.js (app.use(`${API}/productores`)),
+// así que aquí se declaran con "/" y no con "/productores". Repetirlo
+// generaría URLs duplicadas del tipo /api/preenfrio/productores/productores.
 //
-// POR QUÉ LA ESCRITURA ES COORDINADOR+
-//   El código de lote de 15 dígitos toma los ÚLTIMOS 2 DÍGITOS del
-//   codigo_productor (ver fn_generar_lote). Editarlo cambia el lote de toda
-//   la fruta de ese productor: no es una tarea de piso.
+// Sin cargarAlcance: un productor no pertenece a un preenfrío. El recorte
+// por cámara empieza en producción y recepciones.
 //
-// NO SE FILTRA POR CÁMARA
-//   Un productor no pertenece a un preenfrío, así que este módulo no usa
-//   cargarAlcance. El recorte por cámara aplica de produccion/recepciones
-//   en adelante.
+// VER queda en operativo porque este catálogo alimenta los dropdowns de
+// producción: sin él, no se podría capturar de qué productor viene la fruta.
+//
+// ESCRITURA sube a coordinador: codigo_productor aporta 2 de los 15 dígitos
+// del código de lote. Editarlo cambia el lote de toda la fruta de ese
+// productor, no es decisión de piso.
 // ============================================================================
 
-// Sesión válida para todo el módulo
-router.use(verifyToken);
+// ---- Consultas ----
+// Filtros opcionales: ?activo=1 · ?buscar=texto
+router.get("/", verifyToken, verifyOperativo, productoresController.getProductores);
 
-// ---------------------------------------------------------------- LECTURA
-// Sin verificador de rol extra: el preenfrío necesita el catálogo completo
-// para capturar recepciones y producción.
-router.get("/", ProductoresController.listar);
-router.get("/:id", ProductoresController.obtener);
+router.get("/:id", verifyToken, verifyOperativo, validarIdProductor, productoresController.getProductorById);
 
-// --------------------------------------------------------------- ESCRITURA
-router.post("/", verifyCoordinador, ProductoresController.crear);
-router.put("/:id", verifyCoordinador, ProductoresController.actualizar);
+// ---- Alta y edición ----
+// El controller valida que el código no esté duplicado antes de insertar
+router.post("/", verifyToken, verifyCoordinador, validarProductor, productoresController.createProductor);
 
-// Baja LÓGICA (activo = 0). Nunca DELETE físico: fincas.id_productor y
-// produccion.id_productor apuntan aquí y se perdería la trazabilidad.
-router.delete("/:id", verifyCoordinador, ProductoresController.darDeBaja);
+router.put("/:id", verifyToken, verifyCoordinador, validarIdProductor, validarProductor, productoresController.updateProductor);
 
-router.patch("/:id/reactivar", verifyCoordinador, ProductoresController.reactivar);
+// ---- Baja ----
+// Lógica (activo = 0), no física: fincas y produccion referencian esta tabla
+router.delete("/:id", verifyToken, verifyCoordinador, validarIdProductor, productoresController.bajaProductor);
+
+router.patch("/:id/reactivar", verifyToken, verifyCoordinador, validarIdProductor, productoresController.reactivarProductor);
 
 export default router;

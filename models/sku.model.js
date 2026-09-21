@@ -1,178 +1,141 @@
-// ============================================================================
-// MODELO · SKU DE PRODUCTO TERMINADO
-// ----------------------------------------------------------------------------
-// Tabla: sku_pt (Bloque 3 del esquema)
-//   id_sku     SERIAL PK
-//   codigo_sku VARCHAR(10) NOT NULL
-//   calidad    VARCHAR(70) NOT NULL
-//   turno      INT NOT NULL DEFAULT 1
-//
-// POR QUÉ EL TURNO VIVE AQUÍ
-//   El turno es una propiedad FIJA del SKU (depende de la calidad), no del
-//   día de trabajo. Es el ÚLTIMO dígito del código de lote de 15 dígitos y
-//   fn_generar_lote() lo recibe desde este catálogo.
-//
-// POR QUÉ produccion NO TIENE COLUMNA 'calidad'
-//   Se resuelve por JOIN contra sku_pt. Duplicarla habría permitido que una
-//   producción dijera "PRIMERA" mientras su SKU dice otra cosa.
-//
-// CAJAS POR TARIMA
-//   Regla operativa: 48 cajas = 1 tarima, salvo los SKU de la familia
-//   CPL0813, donde son 42. No se guarda en la tabla: se expone como campo
-//   calculado para que el front, el dashboard y la importación del Excel
-//   usen el mismo criterio sin replicar el if.
-// ============================================================================
-
 import { db } from "../database/connection.database.js";
 
-/** Regla de estiba: 42 cajas por tarima en la familia CPL0813, 48 en el resto. */
-export const CAJAS_POR_TARIMA_DEFAULT = 48;
-export const CAJAS_POR_TARIMA_CPL0813 = 42;
+// ============================================================================
+// SKU DE PRODUCTO TERMINADO
+// ============================================================================
+// Catálogo de empaques y calidades. Aporta el ÚLTIMO dígito del código de
+// lote a través de 'turno'.
+//
+// POR QUÉ EL TURNO VIVE AQUÍ Y NO EN PRODUCCIÓN
+//   Es una propiedad fija del SKU: depende de la calidad, no del día ni del
+//   horario en que se trabajó. Si estuviera en produccion habría que
+//   recordarlo en cada captura y tarde o temprano saldría mal.
+//
+// POR QUÉ produccion NO GUARDA 'calidad'
+//   Se resuelve por JOIN contra esta tabla. Duplicarla habría permitido que
+//   una producción dijera PRIMERA mientras su SKU dice otra cosa, y ningún
+//   trigger podría detectarlo.
+//
+// CAJAS POR TARIMA
+//   48 cajas = 1 tarima, salvo la familia CPL0813 donde son 42. No se
+//   guarda como columna: se calcula aquí para que el dashboard, el frontend
+//   y la importación del Excel usen el mismo criterio. Si mañana cambia la
+//   regla, se cambia en un solo lugar.
+// ============================================================================
 
-/** Expresión SQL reutilizable para no repetir el CASE en cada consulta. */
-const SQL_CAJAS_POR_TARIMA = `
-    CASE WHEN UPPER(codigo_sku) LIKE 'CPL0813%'
-         THEN ${CAJAS_POR_TARIMA_CPL0813}
-         ELSE ${CAJAS_POR_TARIMA_DEFAULT}
-    END AS cajas_por_tarima`;
+const CAJAS_TARIMA_DEFAULT = 48;
+const CAJAS_TARIMA_CPL0813 = 42;
 
-/**
- * Lista los SKU.
- * @param {Object}  filtros
- * @param {number} [filtros.turno]   1 o 2
- * @param {string} [filtros.calidad] coincidencia parcial
- * @param {string} [filtros.buscar]  texto libre contra código o calidad
- */
-const listar = async ({ turno, calidad, buscar } = {}) => {
-    const condiciones = [];
-    const valores = [];
+const SELECT_SKU = `
+    SELECT
+        s.*,
+        CASE WHEN UPPER(s.codigo_sku) LIKE 'CPL0813%'
+             THEN ${CAJAS_TARIMA_CPL0813}
+             ELSE ${CAJAS_TARIMA_DEFAULT}
+        END AS cajas_por_tarima,
+        -- Cuántas producciones lo usan: la pantalla marca con esto los SKU
+        -- que ya no se pueden borrar, antes de que el usuario lo intente.
+        (SELECT COUNT(*) FROM produccion pr
+          WHERE pr.id_sku = s.id_sku
+        ) AS total_producciones
+    FROM sku_pt s
+`;
 
-    if (turno) {
-        valores.push(Number(turno));
-        condiciones.push(`turno = $${valores.length}`);
-    }
-
-    if (calidad) {
-        valores.push(`%${calidad}%`);
-        condiciones.push(`calidad ILIKE $${valores.length}`);
-    }
-
-    if (buscar) {
-        valores.push(`%${buscar}%`);
-        condiciones.push(
-            `(codigo_sku ILIKE $${valores.length} OR calidad ILIKE $${valores.length})`
-        );
-    }
-
-    const where = condiciones.length ? `WHERE ${condiciones.join(" AND ")}` : "";
-
-    const { rows } = await db.query(
-        `SELECT id_sku,
-                codigo_sku,
-                calidad,
-                turno,
-                ${SQL_CAJAS_POR_TARIMA}
-           FROM sku_pt
-           ${where}
-          ORDER BY codigo_sku ASC`,
-        valores
+const getSkus = async ({ turno = null, calidad = null, buscar = null } = {}) => {
+    const result = await db.query(
+        `
+        ${SELECT_SKU}
+        WHERE ($1::INT IS NULL OR s.turno = $1)
+          AND ($2::TEXT IS NULL OR s.calidad ILIKE '%' || $2 || '%')
+          AND ($3::TEXT IS NULL
+               OR s.codigo_sku ILIKE '%' || $3 || '%'
+               OR s.calidad ILIKE '%' || $3 || '%')
+        ORDER BY s.codigo_sku, s.calidad
+        `,
+        [turno, calidad, buscar]
     );
-
-    return rows;
+    return result.rows;
 };
 
-/** Un SKU por id. */
-const obtenerPorId = async (id_sku) => {
-    const { rows } = await db.query(
-        `SELECT id_sku, codigo_sku, calidad, turno, ${SQL_CAJAS_POR_TARIMA}
-           FROM sku_pt
-          WHERE id_sku = $1`,
+const getSkuById = async (id_sku) => {
+    const result = await db.query(
+        `${SELECT_SKU} WHERE s.id_sku = $1`,
         [id_sku]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-/**
- * Duplicado por código + calidad.
- * No se valida solo por código: el mismo empaque puede existir en varias
- * calidades y son SKU distintos para efectos del lote.
- */
-const obtenerPorCodigoYCalidad = async (codigo_sku, calidad, excluirId = null) => {
-    const valores = [codigo_sku, calidad];
-    let filtroExtra = "";
-
-    if (excluirId) {
-        valores.push(excluirId);
-        filtroExtra = `AND id_sku <> $${valores.length}`;
-    }
-
-    const { rows } = await db.query(
-        `SELECT id_sku, codigo_sku, calidad, turno
-           FROM sku_pt
-          WHERE UPPER(codigo_sku) = UPPER($1)
-            AND UPPER(calidad)    = UPPER($2)
-            ${filtroExtra}`,
-        valores
+// Duplicado por código + calidad, no solo por código.
+// El mismo empaque puede existir en PRIMERA y en SEGUNDA: son SKU distintos
+// y cada uno lleva su propio turno, así que generan lotes diferentes.
+const existeSku = async (codigo_sku, calidad, id_excluir = null) => {
+    const result = await db.query(
+        `
+        SELECT id_sku, codigo_sku, calidad FROM sku_pt
+        WHERE UPPER(codigo_sku) = UPPER($1)
+          AND UPPER(calidad) = UPPER($2)
+          AND ($3::INT IS NULL OR id_sku <> $3)
+        `,
+        [codigo_sku, calidad, id_excluir]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-/** Alta. Turno por defecto 1, igual que el DEFAULT de la tabla. */
-const crear = async ({ codigo_sku, calidad, turno = 1 }) => {
-    const { rows } = await db.query(
-        `INSERT INTO sku_pt (codigo_sku, calidad, turno)
-         VALUES (UPPER($1), UPPER($2), $3)
-         RETURNING id_sku, codigo_sku, calidad, turno`,
+const createSku = async ({ codigo_sku, calidad, turno }) => {
+    const result = await db.query(
+        `
+        INSERT INTO sku_pt (codigo_sku, calidad, turno)
+        VALUES ($1, $2, $3)
+        RETURNING *
+        `,
         [codigo_sku, calidad, turno]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-/** Actualización parcial. */
-const actualizar = async (id_sku, { codigo_sku, calidad, turno }) => {
-    const { rows } = await db.query(
-        `UPDATE sku_pt
-            SET codigo_sku = COALESCE(UPPER($2), codigo_sku),
-                calidad    = COALESCE(UPPER($3), calidad),
-                turno      = COALESCE($4, turno)
-          WHERE id_sku = $1
-         RETURNING id_sku, codigo_sku, calidad, turno`,
-        [id_sku, codigo_sku ?? null, calidad ?? null, turno ?? null]
+const updateSku = async (id_sku, { codigo_sku, calidad, turno }) => {
+    const result = await db.query(
+        `
+        UPDATE sku_pt
+        SET codigo_sku = $1, calidad = $2, turno = $3
+        WHERE id_sku = $4
+        RETURNING *
+        `,
+        [codigo_sku, calidad, turno, id_sku]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-/**
- * Producciones que usan este SKU.
- * sku_pt NO tiene columna de estado, así que la única baja posible es el
- * DELETE físico. El controlador solo lo permite si no hay dependencias.
- */
-const contarDependencias = async (id_sku) => {
-    const { rows } = await db.query(
-        `SELECT (SELECT COUNT(*) FROM produccion
-                  WHERE id_sku = $1)::INT AS producciones`,
+// sku_pt no tiene columna de estado, así que la única baja posible es el
+// borrado físico. Si alguna producción lo referencia, la FK lo impide
+// (error 23503) y el controller lo traduce a un mensaje entendible.
+const deleteSku = async (id_sku) => {
+    const result = await db.query(
+        `DELETE FROM sku_pt WHERE id_sku = $1 RETURNING *`,
         [id_sku]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-/** DELETE físico. Solo se invoca tras verificar que no hay producciones. */
-const eliminar = async (id_sku) => {
-    const { rows } = await db.query(
-        `DELETE FROM sku_pt
-          WHERE id_sku = $1
-         RETURNING id_sku, codigo_sku, calidad, turno`,
+const getDependencias = async (id_sku) => {
+    const result = await db.query(
+        `
+        SELECT (SELECT COUNT(*) FROM produccion
+                 WHERE id_sku = $1) AS producciones
+        `,
         [id_sku]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-export const SkuModel = {
-    listar,
-    obtenerPorId,
-    obtenerPorCodigoYCalidad,
-    crear,
-    actualizar,
-    contarDependencias,
-    eliminar
+const skuModel = {
+    getSkus,
+    getSkuById,
+    existeSku,
+    createSku,
+    updateSku,
+    deleteSku,
+    getDependencias
 };
+
+export default skuModel;

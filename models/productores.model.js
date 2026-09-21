@@ -1,180 +1,156 @@
-// ============================================================================
-// MODELO · PRODUCTORES
-// ----------------------------------------------------------------------------
-// Tabla: productores (Bloque 3 del esquema)
-//   id_productor      SERIAL PK
-//   codigo_productor  VARCHAR(4) UNIQUE NOT NULL  -> alimenta el codigo_lote
-//   nombre            VARCHAR(100) NOT NULL
-//   activo            INT DEFAULT 1               -> 1 activo · 0 dado de baja
-//
-// NOTA DE ALCANCE
-//   Los catálogos de origen NO se filtran por cámara: un productor no
-//   pertenece a un preenfrío. Por eso aquí no entra el arreglo req.camaras.
-//   El recorte por cámara aplica de produccion/recepciones en adelante.
-//
-// NOTA SOBRE LA BAJA
-//   No se hace DELETE físico. fincas.id_productor y produccion.id_productor
-//   apuntan aquí; borrar la fila rompería el histórico y la trazabilidad del
-//   lote. Se marca activo = 0 y deja de aparecer en los selectores.
-// ============================================================================
-
 import { db } from "../database/connection.database.js";
 
-/**
- * Lista productores con filtros opcionales.
- * @param {Object}  filtros
- * @param {number} [filtros.activo]  1 = solo activos · 0 = solo bajas · undefined = todos
- * @param {string} [filtros.buscar]  texto libre contra código o nombre
- */
-const listar = async ({ activo, buscar } = {}) => {
-    const condiciones = [];
-    const valores = [];
+// ============================================================================
+// PRODUCTORES
+// ============================================================================
+// Catálogo de origen. Es la base de 'fincas': una finca siempre pertenece a
+// un productor, y de ahí salen 2 de los 15 dígitos del código de lote.
+//
+// SIN ALCANCE POR CÁMARA
+//   Un productor no pertenece a un preenfrío, así que este modelo no recibe
+//   el arreglo req.camaras. El recorte por cámara empieza en producción y
+//   recepciones, donde la fruta ya está físicamente en una planta.
+//
+// LA BAJA ES LÓGICA
+//   Nunca DELETE: fincas.id_productor y produccion.id_productor apuntan
+//   aquí. Borrar la fila dejaría lotes históricos sin su origen. Se marca
+//   activo = 0 y deja de ofrecerse en los selectores.
+// ============================================================================
 
-    if (activo !== undefined && activo !== null && activo !== "") {
-        valores.push(Number(activo));
-        condiciones.push(`activo = $${valores.length}`);
-    }
-
-    if (buscar) {
-        // ILIKE: búsqueda sin distinguir mayúsculas (en piso capturan de todo)
-        valores.push(`%${buscar}%`);
-        condiciones.push(
-            `(codigo_productor ILIKE $${valores.length} OR nombre ILIKE $${valores.length})`
-        );
-    }
-
-    const where = condiciones.length ? `WHERE ${condiciones.join(" AND ")}` : "";
-
-    const { rows } = await db.query(
-        `SELECT id_productor,
-                codigo_productor,
-                nombre,
-                activo
-           FROM productores
-           ${where}
-          ORDER BY codigo_productor ASC`,
-        valores
+// Lista con el conteo de fincas, para que la pantalla muestre de un vistazo
+// qué productores tienen operación y cuáles quedaron vacíos.
+//
+// Los filtros son opcionales. El patrón ($1::INT IS NULL OR ...) evita
+// armar SQL dinámico: si el parámetro llega NULL la condición se cumple
+// siempre y la misma query sirve para todos los casos.
+const getProductores = async ({ activo = null, buscar = null } = {}) => {
+    const result = await db.query(
+        `
+        SELECT
+            p.*,
+            (SELECT COUNT(*) FROM fincas f
+              WHERE f.id_productor = p.id_productor
+            ) AS total_fincas
+        FROM productores p
+        WHERE ($1::INT IS NULL OR p.activo = $1)
+          AND ($2::TEXT IS NULL
+               OR p.codigo_productor ILIKE '%' || $2 || '%'
+               OR p.nombre ILIKE '%' || $2 || '%')
+        ORDER BY p.codigo_productor
+        `,
+        [activo, buscar]
     );
-
-    return rows;
+    return result.rows;
 };
 
-/** Un productor por id. Devuelve undefined si no existe. */
-const obtenerPorId = async (id_productor) => {
-    const { rows } = await db.query(
-        `SELECT id_productor, codigo_productor, nombre, activo
-           FROM productores
-          WHERE id_productor = $1`,
+const getProductorById = async (id_productor) => {
+    const result = await db.query(
+        `SELECT * FROM productores WHERE id_productor = $1`,
         [id_productor]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-/**
- * Busca por código de negocio. Se usa para validar duplicados antes de
- * insertar y para importaciones desde el Excel de planeación.
- * @param {string} codigo
- * @param {number} [excluirId]  id que NO cuenta como duplicado (caso editar)
- */
-const obtenerPorCodigo = async (codigo, excluirId = null) => {
-    const valores = [codigo];
-    let filtroExtra = "";
-
-    if (excluirId) {
-        valores.push(excluirId);
-        filtroExtra = `AND id_productor <> $${valores.length}`;
-    }
-
-    const { rows } = await db.query(
-        `SELECT id_productor, codigo_productor, nombre, activo
-           FROM productores
-          WHERE UPPER(codigo_productor) = UPPER($1)
-            ${filtroExtra}`,
-        valores
+// Verifica si un código ya está en uso.
+// Se consulta antes de insertar para dar un mensaje claro en vez de dejar
+// que reviente el índice UNIQUE.
+//
+// Al editar se excluye el propio id: guardar sin cambiar el código no debe
+// marcar conflicto consigo mismo.
+const existeCodigo = async (codigo_productor, id_excluir = null) => {
+    const result = await db.query(
+        `
+        SELECT id_productor, nombre FROM productores
+        WHERE UPPER(codigo_productor) = UPPER($1)
+          AND ($2::INT IS NULL OR id_productor <> $2)
+        `,
+        [codigo_productor, id_excluir]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-/** Alta. El código se guarda siempre en mayúsculas. */
-const crear = async ({ codigo_productor, nombre, activo = 1 }) => {
-    const { rows } = await db.query(
-        `INSERT INTO productores (codigo_productor, nombre, activo)
-         VALUES (UPPER($1), $2, $3)
-         RETURNING id_productor, codigo_productor, nombre, activo`,
+const createProductor = async ({ codigo_productor, nombre, activo }) => {
+    const result = await db.query(
+        `
+        INSERT INTO productores (codigo_productor, nombre, activo)
+        VALUES ($1, $2, $3)
+        RETURNING *
+        `,
         [codigo_productor, nombre, activo]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-/**
- * Actualización parcial: solo se pisan los campos que vienen en el body.
- * COALESCE deja intacto lo que llegue como NULL.
- */
-const actualizar = async (id_productor, { codigo_productor, nombre, activo }) => {
-    const { rows } = await db.query(
-        `UPDATE productores
-            SET codigo_productor = COALESCE(UPPER($2), codigo_productor),
-                nombre           = COALESCE($3, nombre),
-                activo           = COALESCE($4, activo)
-          WHERE id_productor = $1
-         RETURNING id_productor, codigo_productor, nombre, activo`,
-        [
-            id_productor,
-            codigo_productor ?? null,
-            nombre ?? null,
-            activo ?? null
-        ]
+// Actualiza las tres columnas siempre: el middleware ya garantizó que
+// vengan completas y normalizadas. Un UPDATE parcial con COALESCE haría
+// imposible distinguir "no lo mandes" de "ponlo en cero".
+const updateProductor = async (
+    id_productor,
+    { codigo_productor, nombre, activo }
+) => {
+    const result = await db.query(
+        `
+        UPDATE productores
+        SET codigo_productor = $1, nombre = $2, activo = $3
+        WHERE id_productor = $4
+        RETURNING *
+        `,
+        [codigo_productor, nombre, activo, id_productor]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-/** Baja lógica. Nunca DELETE: hay FK desde fincas y produccion. */
-const darDeBaja = async (id_productor) => {
-    const { rows } = await db.query(
-        `UPDATE productores
-            SET activo = 0
-          WHERE id_productor = $1
-         RETURNING id_productor, codigo_productor, nombre, activo`,
+// Baja lógica. El histórico de fincas y producción se conserva intacto.
+const bajaProductor = async (id_productor) => {
+    const result = await db.query(
+        `
+        UPDATE productores SET activo = 0
+        WHERE id_productor = $1
+        RETURNING *
+        `,
         [id_productor]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-/** Reactivar un productor dado de baja. */
-const reactivar = async (id_productor) => {
-    const { rows } = await db.query(
-        `UPDATE productores
-            SET activo = 1
-          WHERE id_productor = $1
-         RETURNING id_productor, codigo_productor, nombre, activo`,
+const reactivarProductor = async (id_productor) => {
+    const result = await db.query(
+        `
+        UPDATE productores SET activo = 1
+        WHERE id_productor = $1
+        RETURNING *
+        `,
         [id_productor]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-/**
- * Cuenta las dependencias antes de permitir una baja.
- * El controlador lo usa para avisar al usuario qué queda afectado.
- */
-const contarDependencias = async (id_productor) => {
-    const { rows } = await db.query(
-        `SELECT
+// Qué queda colgando si se da de baja.
+// El controller lo devuelve como aviso: el usuario merece saber que sus
+// fincas siguen ahí y que las producciones viejas no se tocan.
+const getDependencias = async (id_productor) => {
+    const result = await db.query(
+        `
+        SELECT
             (SELECT COUNT(*) FROM fincas
-              WHERE id_productor = $1)::INT AS fincas,
+              WHERE id_productor = $1) AS fincas,
             (SELECT COUNT(*) FROM produccion
-              WHERE id_productor = $1)::INT AS producciones`,
+              WHERE id_productor = $1) AS producciones
+        `,
         [id_productor]
     );
-    return rows[0];
+    return result.rows[0];
 };
 
-export const ProductoresModel = {
-    listar,
-    obtenerPorId,
-    obtenerPorCodigo,
-    crear,
-    actualizar,
-    darDeBaja,
-    reactivar,
-    contarDependencias
+const productoresModel = {
+    getProductores,
+    getProductorById,
+    existeCodigo,
+    createProductor,
+    updateProductor,
+    bajaProductor,
+    reactivarProductor,
+    getDependencias
 };
+
+export default productoresModel;

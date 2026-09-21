@@ -1,195 +1,178 @@
+import productoresModel from "../models/productores.model.js";
+
 // ============================================================================
-// CONTROLADOR · PRODUCTORES
-// ----------------------------------------------------------------------------
-// Reglas de negocio que se validan aquí (no en la BD):
-//   · codigo_productor: 1 a 4 caracteres, único en todo el catálogo.
-//     El código de lote toma sus ÚLTIMOS 2 dígitos (ver fn_generar_lote),
-//     así que dos productores con código terminando igual producirían lotes
-//     idénticos. El UNIQUE es real y se valida antes de insertar para
-//     devolver un mensaje claro en vez del error 23505 de Postgres.
-//   · La baja es lógica (activo = 0). Nunca DELETE: hay FK desde fincas y
-//     produccion; borrar rompería la trazabilidad del lote.
+// PRODUCTORES
+// ============================================================================
+// Catálogo sin alcance por cámara: un productor no pertenece a un preenfrío.
+// El acceso lo limita el rol (coordinador+ para escribir), no la ubicación.
+//
+// La validación de formato vive en productores.middleware.js. Aquí solo
+// queda lo que necesita consultar la BD: duplicados y dependencias.
 // ============================================================================
 
-import { ProductoresModel } from "../models/productores.model.js";
-
-/** GET /api/preenfrio/productores?activo=1&buscar=texto */
-const listar = async (req, res) => {
+// GET /api/preenfrio/productores?activo=1&buscar=texto
+const getProductores = async (req, res) => {
     try {
         const { activo, buscar } = req.query;
-        const productores = await ProductoresModel.listar({ activo, buscar });
-        return res.json(productores);
+
+        const productores = await productoresModel.getProductores({
+            activo: activo !== undefined && activo !== "" ? Number(activo) : null,
+            buscar: buscar || null
+        });
+
+        res.status(200).json(productores);
     } catch (error) {
-        console.error("[productores.listar]", error);
-        return res.status(500).json({ error: "Error al consultar productores" });
+        console.error("Error al obtener productores:", error);
+        res.status(500).json({ error: "Error al obtener los productores" });
     }
 };
 
-/** GET /api/preenfrio/productores/:id */
-const obtener = async (req, res) => {
+// GET /api/preenfrio/productores/:id
+const getProductorById = async (req, res) => {
     try {
-        const productor = await ProductoresModel.obtenerPorId(req.params.id);
+        const { id } = req.params;
+        const productor = await productoresModel.getProductorById(id);
 
         if (!productor) {
             return res.status(404).json({ error: "Productor no encontrado" });
         }
 
-        return res.json(productor);
+        res.status(200).json(productor);
     } catch (error) {
-        console.error("[productores.obtener]", error);
-        return res.status(500).json({ error: "Error al consultar el productor" });
+        console.error("Error al obtener productor:", error);
+        res.status(500).json({ error: "Error al obtener el productor" });
     }
 };
 
-/** POST /api/preenfrio/productores */
-const crear = async (req, res) => {
+// POST /api/preenfrio/productores
+const createProductor = async (req, res) => {
     try {
-        const { codigo_productor, nombre, activo } = req.body;
+        const { codigo_productor } = req.body;
 
-        if (!codigo_productor || !nombre) {
-            return res.status(400).json({
-                error: "codigo_productor y nombre son obligatorios"
-            });
-        }
-
-        const codigo = String(codigo_productor).trim().toUpperCase();
-
-        if (codigo.length > 4) {
-            return res.status(400).json({
-                error: "codigo_productor admite máximo 4 caracteres"
-            });
-        }
-
-        const duplicado = await ProductoresModel.obtenerPorCodigo(codigo);
+        // Se valida antes de insertar para dar un mensaje claro en vez de
+        // dejar que reviente el índice UNIQUE.
+        const duplicado = await productoresModel.existeCodigo(codigo_productor);
         if (duplicado) {
             return res.status(409).json({
-                error: `El código ${codigo} ya está en uso por: ${duplicado.nombre}`
+                error: `El código "${codigo_productor}" ya está en uso por: ${duplicado.nombre}`
             });
         }
 
-        const nuevo = await ProductoresModel.crear({
-            codigo_productor: codigo,
-            nombre: String(nombre).trim(),
-            activo: activo ?? 1
-        });
-
-        return res.status(201).json({
-            mensaje: "Productor creado correctamente",
-            productor: nuevo
-        });
+        const nuevo = await productoresModel.createProductor(req.body);
+        res.status(201).json(nuevo);
     } catch (error) {
-        console.error("[productores.crear]", error);
-        return res.status(500).json({ error: "Error al crear el productor" });
+        console.error("Error al crear productor:", error);
+
+        if (error.code === "23505") {
+            return res.status(409).json({
+                error: "Ese código de productor ya existe"
+            });
+        }
+
+        res.status(500).json({
+            error: "Error al crear el productor" +
+                (error.message ? `: ${error.message}` : "")
+        });
     }
 };
 
-/** PUT /api/preenfrio/productores/:id */
-const actualizar = async (req, res) => {
+// PUT /api/preenfrio/productores/:id
+const updateProductor = async (req, res) => {
     try {
         const { id } = req.params;
-        const { codigo_productor, nombre, activo } = req.body;
+        const { codigo_productor } = req.body;
 
-        const existente = await ProductoresModel.obtenerPorId(id);
-        if (!existente) {
+        // Se excluye el propio id: guardar sin cambiar el código no debe
+        // marcar conflicto consigo mismo.
+        const duplicado = await productoresModel.existeCodigo(
+            codigo_productor,
+            Number(id)
+        );
+        if (duplicado) {
+            return res.status(409).json({
+                error: `El código "${codigo_productor}" ya está en uso por: ${duplicado.nombre}`
+            });
+        }
+
+        const actualizado = await productoresModel.updateProductor(id, req.body);
+
+        if (!actualizado) {
             return res.status(404).json({ error: "Productor no encontrado" });
         }
 
-        let codigo = null;
+        res.status(200).json(actualizado);
+    } catch (error) {
+        console.error("Error al actualizar productor:", error);
 
-        if (codigo_productor) {
-            codigo = String(codigo_productor).trim().toUpperCase();
-
-            if (codigo.length > 4) {
-                return res.status(400).json({
-                    error: "codigo_productor admite máximo 4 caracteres"
-                });
-            }
-
-            // Se excluye el propio id: reenviar su mismo código no es duplicado
-            const duplicado = await ProductoresModel.obtenerPorCodigo(codigo, id);
-            if (duplicado) {
-                return res.status(409).json({
-                    error: `El código ${codigo} ya está en uso por: ${duplicado.nombre}`
-                });
-            }
+        if (error.code === "23505") {
+            return res.status(409).json({
+                error: "Ese código de productor ya existe"
+            });
         }
 
-        const actualizado = await ProductoresModel.actualizar(id, {
-            codigo_productor: codigo,
-            nombre: nombre ? String(nombre).trim() : null,
-            activo
-        });
-
-        return res.json({
-            mensaje: "Productor actualizado correctamente",
-            productor: actualizado
-        });
-    } catch (error) {
-        console.error("[productores.actualizar]", error);
-        return res.status(500).json({ error: "Error al actualizar el productor" });
+        res.status(500).json({ error: "Error al actualizar el productor" });
     }
 };
 
-/**
- * DELETE /api/preenfrio/productores/:id  → baja LÓGICA
- * Se informan las dependencias para que el usuario sepa qué queda colgando:
- * las fincas y producciones históricas siguen existiendo, el productor
- * simplemente deja de ofrecerse en los selectores.
- */
-const darDeBaja = async (req, res) => {
+// DELETE /api/preenfrio/productores/:id
+// Baja LÓGICA: nunca se borra la fila. fincas y produccion apuntan aquí y
+// el histórico tiene que poder resolver su origen.
+const bajaProductor = async (req, res) => {
     try {
         const { id } = req.params;
 
-        const existente = await ProductoresModel.obtenerPorId(id);
+        const existente = await productoresModel.getProductorById(id);
         if (!existente) {
             return res.status(404).json({ error: "Productor no encontrado" });
         }
 
         if (existente.activo === 0) {
-            return res.status(400).json({ error: "El productor ya está dado de baja" });
+            return res.status(409).json({
+                error: "El productor ya está dado de baja"
+            });
         }
 
-        const dependencias = await ProductoresModel.contarDependencias(id);
-        const productor = await ProductoresModel.darDeBaja(id);
+        // Se informa qué queda colgando: el usuario merece saber que sus
+        // fincas siguen ahí y que las producciones viejas no se tocan.
+        const dependencias = await productoresModel.getDependencias(id);
+        const productor = await productoresModel.bajaProductor(id);
 
-        return res.json({
+        res.status(200).json({
             mensaje: "Productor dado de baja. El histórico se conserva.",
             productor,
             dependencias
         });
     } catch (error) {
-        console.error("[productores.darDeBaja]", error);
-        return res.status(500).json({ error: "Error al dar de baja el productor" });
+        console.error("Error al dar de baja el productor:", error);
+        res.status(500).json({ error: "Error al dar de baja el productor" });
     }
 };
 
-/** PATCH /api/preenfrio/productores/:id/reactivar */
-const reactivar = async (req, res) => {
+// PATCH /api/preenfrio/productores/:id/reactivar
+const reactivarProductor = async (req, res) => {
     try {
         const { id } = req.params;
+        const productor = await productoresModel.reactivarProductor(id);
 
-        const existente = await ProductoresModel.obtenerPorId(id);
-        if (!existente) {
+        if (!productor) {
             return res.status(404).json({ error: "Productor no encontrado" });
         }
 
-        const productor = await ProductoresModel.reactivar(id);
-
-        return res.json({
+        res.status(200).json({
             mensaje: "Productor reactivado correctamente",
             productor
         });
     } catch (error) {
-        console.error("[productores.reactivar]", error);
-        return res.status(500).json({ error: "Error al reactivar el productor" });
+        console.error("Error al reactivar el productor:", error);
+        res.status(500).json({ error: "Error al reactivar el productor" });
     }
 };
 
-export const ProductoresController = {
-    listar,
-    obtener,
-    crear,
-    actualizar,
-    darDeBaja,
-    reactivar
+export const productoresController = {
+    getProductores,
+    getProductorById,
+    createProductor,
+    updateProductor,
+    bajaProductor,
+    reactivarProductor
 };

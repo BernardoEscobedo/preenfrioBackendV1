@@ -1,48 +1,48 @@
 import { Router } from "express";
-import { SkuController } from "../controllers/sku.controller.js";
+import { skuController } from "../controllers/sku.controller.js";
+import { validarSku, validarIdSku } from "../middlewares/sku.middleware.js";
 import {
     verifyToken,
     verifyAdmin,
-    verifyCoordinador
+    verifyCoordinador,
+    verifyOperativo
 } from "../middlewares/jwt.middleware.js";
 
 const router = Router();
 
 // ============================================================================
-// SKU DE PRODUCTO TERMINADO  ·  ver = operativo+  ·  crear/editar = coordinador+
-//                            ·  eliminar = admin
-// ----------------------------------------------------------------------------
-// Montaje en index.js:
-//     app.use(`${API}/sku`, skuRouter);
-// URL final: /api/preenfrio/sku
-//
-// POR QUÉ EL DELETE ES SOLO ADMIN
-//   sku_pt NO tiene columna de estado, así que la única baja posible es el
-//   DELETE físico. El controlador lo bloquea con 409 si alguna producción lo
-//   referencia, pero aun así se reserva al rol 1: produccion resuelve la
-//   calidad por JOIN contra esta tabla.
+// SKU DE PRODUCTO TERMINADO
+// ver = operativo+ · crear/editar = coordinador+ · eliminar = admin
+// ============================================================================
+// ELIMINAR sube a admin porque es el único catálogo del bloque cuya baja es
+// FÍSICA: sku_pt no tiene columna de estado. El controller ya bloquea el
+// borrado si hay producciones ligadas, pero el guard añade una segunda
+// barrera sobre una acción irreversible.
 //
 // CAMPO CALCULADO EN LA RESPUESTA
-//   Cada SKU devuelve "cajas_por_tarima": 42 para la familia CPL0813, 48
-//   para el resto. Se calcula en el modelo para que el dashboard, el front
-//   y la importación del Excel usen el mismo criterio sin replicar el if.
+//   Cada SKU trae "cajas_por_tarima": 42 en la familia CPL0813, 48 en el
+//   resto. Se calcula en el modelo para que el dashboard, el frontend y la
+//   importación del Excel usen el mismo criterio sin replicar la regla.
 //
-// TURNO
-//   Es el ÚLTIMO dígito del código de lote y propiedad FIJA del SKU (depende
-//   de la calidad, no del día de trabajo). Solo admite 1 o 2.
+//   También trae "total_producciones": la pantalla lo usa para deshabilitar
+//   el botón de borrar antes de que el usuario lo intente.
 // ============================================================================
 
-router.use(verifyToken);
+// ---- Consultas ----
+// Filtros: ?turno=1 · ?calidad=PRIMERA · ?buscar=texto
+router.get("/", verifyToken, verifyOperativo, skuController.getSkus);
 
-// ---------------------------------------------------------------- LECTURA
-router.get("/", SkuController.listar);
-router.get("/:id", SkuController.obtener);
+router.get("/:id", verifyToken, verifyOperativo, validarIdSku, skuController.getSkuById);
 
-// --------------------------------------------------------------- ESCRITURA
-router.post("/", verifyCoordinador, SkuController.crear);
-router.put("/:id", verifyCoordinador, SkuController.actualizar);
+// ---- Alta y edición ----
+// El duplicado se mide por código + calidad: el mismo empaque en PRIMERA y
+// en SEGUNDA son dos SKU válidos con turnos distintos.
+router.post("/", verifyToken, verifyCoordinador, validarSku, skuController.createSku);
 
-// Borrado FÍSICO. El controlador valida dependencias antes de ejecutarlo.
-router.delete("/:id", verifyAdmin, SkuController.eliminar);
+router.put("/:id", verifyToken, verifyCoordinador, validarIdSku, validarSku, skuController.updateSku);
+
+// ---- Baja ----
+// FÍSICA. El controller verifica dependencias antes de ejecutarla.
+router.delete("/:id", verifyToken, verifyAdmin, validarIdSku, skuController.deleteSku);
 
 export default router;
