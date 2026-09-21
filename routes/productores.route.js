@@ -1,44 +1,47 @@
-// ============================================================================
-// RUTAS · PRODUCTORES
-// ----------------------------------------------------------------------------
-// Montaje en index.js:
-//     app.use(`${API}/productores`, productoresRouter);
-//
-// URL final: http://localhost:3000/api/preenfrio/productores
-//
-// IMPORTANTE: las rutas se declaran con "/" y no con "/productores". El
-// prefijo lo pone el app.use; repetirlo aquí genera URLs duplicadas del
-// tipo /api/preenfrio/camaras/camaras.
-//
-// PERMISOS (jerarquía inclusiva: 1 Admin ⊂ 2 Coordinador ⊂ 3 Supervisor ⊂ 4 Operativo)
-//   · LECTURA   → cualquier usuario autenticado. El preenfrío necesita ver
-//                 el catálogo para capturar recepciones.
-//   · ESCRITURA → roles 1 y 2. Un código de productor mal editado cambia el
-//                 código de lote de toda su fruta; no es tarea de piso.
-// ============================================================================
-
 import { Router } from "express";
 import { ProductoresController } from "../controllers/productores.controller.js";
-
-// ⚠️ Ajustar la ruta y los nombres exportados según tu middleware de auth
-import { verificarToken, verificarRol } from "../middlewares/auth.middleware.js";
+import {
+    verifyToken,
+    verifyCoordinador
+} from "../middlewares/jwt.middleware.js";
 
 const router = Router();
 
-// Todas las rutas del módulo exigen sesión válida
-router.use(verificarToken);
+// ============================================================================
+// PRODUCTORES  ·  ver = operativo+  ·  crear/editar/baja = coordinador+
+// ----------------------------------------------------------------------------
+// Las rutas se declaran con "/" porque el prefijo lo pone index.js:
+//     app.use(`${API}/productores`, productoresRouter);
+// URL final: /api/preenfrio/productores
+//
+// POR QUÉ LA ESCRITURA ES COORDINADOR+
+//   El código de lote de 15 dígitos toma los ÚLTIMOS 2 DÍGITOS del
+//   codigo_productor (ver fn_generar_lote). Editarlo cambia el lote de toda
+//   la fruta de ese productor: no es una tarea de piso.
+//
+// NO SE FILTRA POR CÁMARA
+//   Un productor no pertenece a un preenfrío, así que este módulo no usa
+//   cargarAlcance. El recorte por cámara aplica de produccion/recepciones
+//   en adelante.
+// ============================================================================
+
+// Sesión válida para todo el módulo
+router.use(verifyToken);
 
 // ---------------------------------------------------------------- LECTURA
+// Sin verificador de rol extra: el preenfrío necesita el catálogo completo
+// para capturar recepciones y producción.
 router.get("/", ProductoresController.listar);
 router.get("/:id", ProductoresController.obtener);
 
 // --------------------------------------------------------------- ESCRITURA
-router.post("/", verificarRol([1, 2]), ProductoresController.crear);
-router.put("/:id", verificarRol([1, 2]), ProductoresController.actualizar);
+router.post("/", verifyCoordinador, ProductoresController.crear);
+router.put("/:id", verifyCoordinador, ProductoresController.actualizar);
 
-// Baja lógica (activo = 0). No borra la fila.
-router.delete("/:id", verificarRol([1, 2]), ProductoresController.darDeBaja);
+// Baja LÓGICA (activo = 0). Nunca DELETE físico: fincas.id_productor y
+// produccion.id_productor apuntan aquí y se perdería la trazabilidad.
+router.delete("/:id", verifyCoordinador, ProductoresController.darDeBaja);
 
-router.patch("/:id/reactivar", verificarRol([1, 2]), ProductoresController.reactivar);
+router.patch("/:id/reactivar", verifyCoordinador, ProductoresController.reactivar);
 
 export default router;

@@ -5,7 +5,7 @@ import {
     validarUsuarioEdicion,
     validarIdUsuario
 } from "../middlewares/usuarios.middleware.js";
-import { verifyToken, verifyAdmin, verifyCoordinador } from "../middlewares/jwt.middlewares.js";
+import { verifyToken, verifyAdmin, verifyCoordinador } from "../middlewares/jwt.middleware.js";
 
 const router = Router();
 

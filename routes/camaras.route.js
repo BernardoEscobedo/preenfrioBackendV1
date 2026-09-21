@@ -7,7 +7,7 @@ import {
     verifyAdmin,
     verifyCoordinador,
     verifyOperativo
-} from "../middlewares/jwt.middlewares.js";
+} from "../middlewares/jwt.middleware.js";
 
 const router = Router();
 

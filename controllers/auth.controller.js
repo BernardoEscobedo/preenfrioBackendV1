@@ -1,6 +1,6 @@
 import bcrypt from "bcrypt";
 import authModel from "../models/auth.model.js";
-import { firmarToken } from "../middlewares/jwt.middlewares.js";
+import { firmarToken } from "../middlewares/jwt.middleware.js";
 
 // ============================================================================
 // AUTENTICACIÓN
