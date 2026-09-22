@@ -6,17 +6,20 @@ import productoresModel from "../models/productores.model.js";
 // Catálogo sin alcance por cámara: un productor no pertenece a un preenfrío.
 // El acceso lo limita el rol (coordinador+ para escribir), no la ubicación.
 //
+// v2.2: 'activo' pasó a llamarse 'estado' en toda la aplicación. Los valores
+// son los mismos (1 activo · 0 dado de baja).
+//
 // La validación de formato vive en productores.middleware.js. Aquí solo
 // queda lo que necesita consultar la BD: duplicados y dependencias.
 // ============================================================================
 
-// GET /api/preenfrio/productores?activo=1&buscar=texto
+// GET /api/preenfrio/productores?estado=1&buscar=texto
 const getProductores = async (req, res) => {
     try {
-        const { activo, buscar } = req.query;
+        const { estado, buscar } = req.query;
 
         const productores = await productoresModel.getProductores({
-            activo: activo !== undefined && activo !== "" ? Number(activo) : null,
+            estado: estado !== undefined && estado !== "" ? Number(estado) : null,
             buscar: buscar || null
         });
 
@@ -126,7 +129,7 @@ const bajaProductor = async (req, res) => {
             return res.status(404).json({ error: "Productor no encontrado" });
         }
 
-        if (existente.activo === 0) {
+        if (existente.estado === 0) {
             return res.status(409).json({
                 error: "El productor ya está dado de baja"
             });

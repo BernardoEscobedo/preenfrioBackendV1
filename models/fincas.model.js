@@ -5,11 +5,10 @@ import { db } from "../database/connection.database.js";
 // ============================================================================
 // Origen físico de la fruta. Aporta 3 de los 15 dígitos del código de lote
 // y, sobre todo, la ZONA: es el primer carácter del lote y fn_generar_lote()
-// la traduce a letra (1→A Chiapas · 2→B Colima · 3→C Tabasco · otra→X).
+// la traduce a letra (1→A Chiapas · 2→B Colima · 3→C Tabasco).
 //
-// Una zona mal capturada no rompe nada visible: simplemente todos los lotes
-// de esa finca nacen con la letra equivocada y el error se descubre semanas
-// después, cuando ya hay fruta despachada. Por eso se valida con dureza.
+// v2.2: la BD ya tiene un CHECK que impide guardar una zona fuera de
+// (1,2,3). Antes cualquier entero pasaba y el lote nacía con letra 'X'.
 //
 // SOBRE codigo_finca
 //   La tabla no lo declara UNIQUE porque dos productores distintos pueden
@@ -39,6 +38,9 @@ const ZONA_LETRA = `
 
 // El productor va resuelto en el SELECT para que el frontend no tenga que
 // hacer una consulta por cada renglón de la tabla.
+//
+// v2.2: el alias era 'productor_activo'. Ahora es 'productor_estado', para
+// que coincida con el nombre real de la columna.
 const SELECT_FINCA = `
     SELECT
         f.*,
@@ -46,7 +48,7 @@ const SELECT_FINCA = `
         ${ZONA_LETRA},
         p.codigo_productor,
         p.nombre   AS nombre_productor,
-        p.activo   AS productor_activo
+        p.estado   AS productor_estado
     FROM fincas f
     JOIN productores p ON p.id_productor = f.id_productor
 `;

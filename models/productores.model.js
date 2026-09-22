@@ -6,6 +6,9 @@ import { db } from "../database/connection.database.js";
 // Catálogo de origen. Es la base de 'fincas': una finca siempre pertenece a
 // un productor, y de ahí salen 2 de los 15 dígitos del código de lote.
 //
+// v2.2: la columna se llamaba 'activo'. Ahora es 'estado', igual que en
+// todo el esquema. Los valores no cambiaron: 1 = activo, 0 = dado de baja.
+//
 // SIN ALCANCE POR CÁMARA
 //   Un productor no pertenece a un preenfrío, así que este modelo no recibe
 //   el arreglo req.camaras. El recorte por cámara empieza en producción y
@@ -14,7 +17,7 @@ import { db } from "../database/connection.database.js";
 // LA BAJA ES LÓGICA
 //   Nunca DELETE: fincas.id_productor y produccion.id_productor apuntan
 //   aquí. Borrar la fila dejaría lotes históricos sin su origen. Se marca
-//   activo = 0 y deja de ofrecerse en los selectores.
+//   estado = 0 y deja de ofrecerse en los selectores.
 // ============================================================================
 
 // Lista con el conteo de fincas, para que la pantalla muestre de un vistazo
@@ -23,7 +26,7 @@ import { db } from "../database/connection.database.js";
 // Los filtros son opcionales. El patrón ($1::INT IS NULL OR ...) evita
 // armar SQL dinámico: si el parámetro llega NULL la condición se cumple
 // siempre y la misma query sirve para todos los casos.
-const getProductores = async ({ activo = null, buscar = null } = {}) => {
+const getProductores = async ({ estado = null, buscar = null } = {}) => {
     const result = await db.query(
         `
         SELECT
@@ -32,13 +35,13 @@ const getProductores = async ({ activo = null, buscar = null } = {}) => {
               WHERE f.id_productor = p.id_productor
             ) AS total_fincas
         FROM productores p
-        WHERE ($1::INT IS NULL OR p.activo = $1)
+        WHERE ($1::INT IS NULL OR p.estado = $1)
           AND ($2::TEXT IS NULL
                OR p.codigo_productor ILIKE '%' || $2 || '%'
                OR p.nombre ILIKE '%' || $2 || '%')
         ORDER BY p.codigo_productor
         `,
-        [activo, buscar]
+        [estado, buscar]
     );
     return result.rows;
 };
@@ -55,8 +58,8 @@ const getProductorById = async (id_productor) => {
 // Se consulta antes de insertar para dar un mensaje claro en vez de dejar
 // que reviente el índice UNIQUE.
 //
-// Al editar se excluye el propio id: guardar sin cambiar el código no debe
-// marcar conflicto consigo mismo.
+// Al editar se excluye el propio id, para que guardar sin cambiar el
+// código no marque conflicto consigo mismo.
 const existeCodigo = async (codigo_productor, id_excluir = null) => {
     const result = await db.query(
         `
@@ -69,14 +72,14 @@ const existeCodigo = async (codigo_productor, id_excluir = null) => {
     return result.rows[0];
 };
 
-const createProductor = async ({ codigo_productor, nombre, activo }) => {
+const createProductor = async ({ codigo_productor, nombre, estado }) => {
     const result = await db.query(
         `
-        INSERT INTO productores (codigo_productor, nombre, activo)
+        INSERT INTO productores (codigo_productor, nombre, estado)
         VALUES ($1, $2, $3)
         RETURNING *
         `,
-        [codigo_productor, nombre, activo]
+        [codigo_productor, nombre, estado]
     );
     return result.rows[0];
 };
@@ -86,16 +89,16 @@ const createProductor = async ({ codigo_productor, nombre, activo }) => {
 // imposible distinguir "no lo mandes" de "ponlo en cero".
 const updateProductor = async (
     id_productor,
-    { codigo_productor, nombre, activo }
+    { codigo_productor, nombre, estado }
 ) => {
     const result = await db.query(
         `
         UPDATE productores
-        SET codigo_productor = $1, nombre = $2, activo = $3
+        SET codigo_productor = $1, nombre = $2, estado = $3
         WHERE id_productor = $4
         RETURNING *
         `,
-        [codigo_productor, nombre, activo, id_productor]
+        [codigo_productor, nombre, estado, id_productor]
     );
     return result.rows[0];
 };
@@ -104,7 +107,7 @@ const updateProductor = async (
 const bajaProductor = async (id_productor) => {
     const result = await db.query(
         `
-        UPDATE productores SET activo = 0
+        UPDATE productores SET estado = 0
         WHERE id_productor = $1
         RETURNING *
         `,
@@ -116,7 +119,7 @@ const bajaProductor = async (id_productor) => {
 const reactivarProductor = async (id_productor) => {
     const result = await db.query(
         `
-        UPDATE productores SET activo = 1
+        UPDATE productores SET estado = 1
         WHERE id_productor = $1
         RETURNING *
         `,

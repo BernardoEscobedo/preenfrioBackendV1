@@ -1,155 +1,159 @@
-import skuModel from "../models/sku.model.js";
+import { db } from "../database/connection.database.js";
 
 // ============================================================================
-// SKU DE PRODUCTO TERMINADO
+// PRODUCTORES
 // ============================================================================
-// Catálogo sin alcance por cámara: el SKU describe el producto, no dónde
-// está. El acceso lo limita el rol.
+// Catálogo de origen. Es la base de 'fincas': una finca siempre pertenece a
+// un productor, y de ahí salen 2 de los 15 dígitos del código de lote.
 //
-// A DIFERENCIA DE PRODUCTORES Y FINCAS, LA BAJA ES FÍSICA
-//   sku_pt no tiene columna de estado. Por eso el DELETE verifica primero
-//   que ninguna producción lo use: produccion resuelve la calidad por JOIN
-//   contra esta tabla, y borrar un SKU en uso dejaría esos registros sin
-//   poder mostrar de qué producto hablan.
+// v2.2: la columna se llamaba 'activo'. Ahora es 'estado', igual que en
+// todo el esquema. Los valores no cambiaron: 1 = activo, 0 = dado de baja.
+//
+// SIN ALCANCE POR CÁMARA
+//   Un productor no pertenece a un preenfrío, así que este modelo no recibe
+//   el arreglo req.camaras. El recorte por cámara empieza en producción y
+//   recepciones, donde la fruta ya está físicamente en una planta.
+//
+// LA BAJA ES LÓGICA
+//   Nunca DELETE: fincas.id_productor y produccion.id_productor apuntan
+//   aquí. Borrar la fila dejaría lotes históricos sin su origen. Se marca
+//   estado = 0 y deja de ofrecerse en los selectores.
 // ============================================================================
 
-// GET /api/preenfrio/sku?turno=1&calidad=PRIMERA&buscar=texto
-const getSkus = async (req, res) => {
-    try {
-        const { turno, calidad, buscar } = req.query;
-
-        const skus = await skuModel.getSkus({
-            turno: turno ? Number(turno) : null,
-            calidad: calidad || null,
-            buscar: buscar || null
-        });
-
-        res.status(200).json(skus);
-    } catch (error) {
-        console.error("Error al obtener SKU:", error);
-        res.status(500).json({ error: "Error al obtener los SKU" });
-    }
+// Lista con el conteo de fincas, para que la pantalla muestre de un vistazo
+// qué productores tienen operación y cuáles quedaron vacíos.
+//
+// Los filtros son opcionales. El patrón ($1::INT IS NULL OR ...) evita
+// armar SQL dinámico: si el parámetro llega NULL la condición se cumple
+// siempre y la misma query sirve para todos los casos.
+const getProductores = async ({ estado = null, buscar = null } = {}) => {
+    const result = await db.query(
+        `
+        SELECT
+            p.*,
+            (SELECT COUNT(*) FROM fincas f
+              WHERE f.id_productor = p.id_productor
+            ) AS total_fincas
+        FROM productores p
+        WHERE ($1::INT IS NULL OR p.estado = $1)
+          AND ($2::TEXT IS NULL
+               OR p.codigo_productor ILIKE '%' || $2 || '%'
+               OR p.nombre ILIKE '%' || $2 || '%')
+        ORDER BY p.codigo_productor
+        `,
+        [estado, buscar]
+    );
+    return result.rows;
 };
 
-// GET /api/preenfrio/sku/:id
-const getSkuById = async (req, res) => {
-    try {
-        const { id } = req.params;
-        const sku = await skuModel.getSkuById(id);
-
-        if (!sku) {
-            return res.status(404).json({ error: "SKU no encontrado" });
-        }
-
-        res.status(200).json(sku);
-    } catch (error) {
-        console.error("Error al obtener SKU:", error);
-        res.status(500).json({ error: "Error al obtener el SKU" });
-    }
+const getProductorById = async (id_productor) => {
+    const result = await db.query(
+        `SELECT * FROM productores WHERE id_productor = $1`,
+        [id_productor]
+    );
+    return result.rows[0];
 };
 
-// POST /api/preenfrio/sku
-const createSku = async (req, res) => {
-    try {
-        const { codigo_sku, calidad } = req.body;
-
-        // El duplicado se mide por código + calidad: el mismo empaque en
-        // PRIMERA y en SEGUNDA son dos SKU legítimos.
-        const duplicado = await skuModel.existeSku(codigo_sku, calidad);
-        if (duplicado) {
-            return res.status(409).json({
-                error: `Ya existe el SKU "${codigo_sku}" con calidad "${calidad}"`
-            });
-        }
-
-        const nuevo = await skuModel.createSku(req.body);
-
-        // Se relee para devolver cajas_por_tarima, que es campo calculado
-        const completo = await skuModel.getSkuById(nuevo.id_sku);
-
-        res.status(201).json(completo);
-    } catch (error) {
-        console.error("Error al crear SKU:", error);
-        res.status(500).json({
-            error: "Error al crear el SKU" +
-                (error.message ? `: ${error.message}` : "")
-        });
-    }
+// Verifica si un código ya está en uso.
+// Se consulta antes de insertar para dar un mensaje claro en vez de dejar
+// que reviente el índice UNIQUE.
+//
+// Al editar se excluye el propio id, para que guardar sin cambiar el
+// código no marque conflicto consigo mismo.
+const existeCodigo = async (codigo_productor, id_excluir = null) => {
+    const result = await db.query(
+        `
+        SELECT id_productor, nombre FROM productores
+        WHERE UPPER(codigo_productor) = UPPER($1)
+          AND ($2::INT IS NULL OR id_productor <> $2)
+        `,
+        [codigo_productor, id_excluir]
+    );
+    return result.rows[0];
 };
 
-// PUT /api/preenfrio/sku/:id
-const updateSku = async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { codigo_sku, calidad } = req.body;
-
-        const existente = await skuModel.getSkuById(id);
-        if (!existente) {
-            return res.status(404).json({ error: "SKU no encontrado" });
-        }
-
-        const duplicado = await skuModel.existeSku(codigo_sku, calidad, Number(id));
-        if (duplicado) {
-            return res.status(409).json({
-                error: `Ya existe otro SKU "${codigo_sku}" con calidad "${calidad}"`
-            });
-        }
-
-        await skuModel.updateSku(id, req.body);
-        const completo = await skuModel.getSkuById(id);
-
-        res.status(200).json(completo);
-    } catch (error) {
-        console.error("Error al actualizar SKU:", error);
-        res.status(500).json({ error: "Error al actualizar el SKU" });
-    }
+const createProductor = async ({ codigo_productor, nombre, estado }) => {
+    const result = await db.query(
+        `
+        INSERT INTO productores (codigo_productor, nombre, estado)
+        VALUES ($1, $2, $3)
+        RETURNING *
+        `,
+        [codigo_productor, nombre, estado]
+    );
+    return result.rows[0];
 };
 
-// DELETE /api/preenfrio/sku/:id
-// Borrado FÍSICO. Se verifica primero para poder explicar el motivo en vez
-// de devolver un error de FK que el usuario no entiende.
-const deleteSku = async (req, res) => {
-    try {
-        const { id } = req.params;
-
-        const existente = await skuModel.getSkuById(id);
-        if (!existente) {
-            return res.status(404).json({ error: "SKU no encontrado" });
-        }
-
-        const dependencias = await skuModel.getDependencias(id);
-
-        if (Number(dependencias.producciones) > 0) {
-            return res.status(409).json({
-                error: `No se puede eliminar: ${dependencias.producciones} producción(es) usan este SKU. Edítalo en lugar de borrarlo.`
-            });
-        }
-
-        const eliminado = await skuModel.deleteSku(id);
-
-        res.status(200).json({
-            mensaje: "SKU eliminado correctamente",
-            sku: eliminado
-        });
-    } catch (error) {
-        console.error("Error al eliminar SKU:", error);
-
-        // Red de seguridad por si algo se insertó entre la verificación y
-        // el borrado.
-        if (error.code === "23503") {
-            return res.status(409).json({
-                error: "No se puede eliminar: el SKU tiene producciones asociadas"
-            });
-        }
-
-        res.status(500).json({ error: "Error al eliminar el SKU" });
-    }
+// Actualiza las tres columnas siempre: el middleware ya garantizó que
+// vengan completas y normalizadas. Un UPDATE parcial con COALESCE haría
+// imposible distinguir "no lo mandes" de "ponlo en cero".
+const updateProductor = async (
+    id_productor,
+    { codigo_productor, nombre, estado }
+) => {
+    const result = await db.query(
+        `
+        UPDATE productores
+        SET codigo_productor = $1, nombre = $2, estado = $3
+        WHERE id_productor = $4
+        RETURNING *
+        `,
+        [codigo_productor, nombre, estado, id_productor]
+    );
+    return result.rows[0];
 };
 
-export const skuController = {
-    getSkus,
-    getSkuById,
-    createSku,
-    updateSku,
-    deleteSku
+// Baja lógica. El histórico de fincas y producción se conserva intacto.
+const bajaProductor = async (id_productor) => {
+    const result = await db.query(
+        `
+        UPDATE productores SET estado = 0
+        WHERE id_productor = $1
+        RETURNING *
+        `,
+        [id_productor]
+    );
+    return result.rows[0];
 };
+
+const reactivarProductor = async (id_productor) => {
+    const result = await db.query(
+        `
+        UPDATE productores SET estado = 1
+        WHERE id_productor = $1
+        RETURNING *
+        `,
+        [id_productor]
+    );
+    return result.rows[0];
+};
+
+// Qué queda colgando si se da de baja.
+// El controller lo devuelve como aviso: el usuario merece saber que sus
+// fincas siguen ahí y que las producciones viejas no se tocan.
+const getDependencias = async (id_productor) => {
+    const result = await db.query(
+        `
+        SELECT
+            (SELECT COUNT(*) FROM fincas
+              WHERE id_productor = $1) AS fincas,
+            (SELECT COUNT(*) FROM produccion
+              WHERE id_productor = $1) AS producciones
+        `,
+        [id_productor]
+    );
+    return result.rows[0];
+};
+
+const productoresModel = {
+    getProductores,
+    getProductorById,
+    existeCodigo,
+    createProductor,
+    updateProductor,
+    bajaProductor,
+    reactivarProductor,
+    getDependencias
+};
+
+export default productoresModel;

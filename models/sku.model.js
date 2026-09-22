@@ -6,6 +6,16 @@ import { db } from "../database/connection.database.js";
 // Catálogo de empaques y calidades. Aporta el ÚLTIMO dígito del código de
 // lote a través de 'turno'.
 //
+// v2.2 · CAMBIO IMPORTANTE
+//   sku_pt ya tiene columna 'estado', así que la baja pasó de FÍSICA a
+//   LÓGICA. Antes, un SKU descontinuado solo se podía borrar (y el borrado
+//   quedaba bloqueado en cuanto alguna producción lo usara, que es
+//   prácticamente siempre). Ahora se marca estado = 0 y desaparece de los
+//   dropdowns sin tocar el histórico.
+//
+//   Se conserva deleteSku para el caso legítimo de un alta mal capturada
+//   que nunca llegó a usarse.
+//
 // POR QUÉ EL TURNO VIVE AQUÍ Y NO EN PRODUCCIÓN
 //   Es una propiedad fija del SKU: depende de la calidad, no del día ni del
 //   horario en que se trabajó. Si estuviera en produccion habría que
@@ -34,25 +44,31 @@ const SELECT_SKU = `
              ELSE ${CAJAS_TARIMA_DEFAULT}
         END AS cajas_por_tarima,
         -- Cuántas producciones lo usan: la pantalla marca con esto los SKU
-        -- que ya no se pueden borrar, antes de que el usuario lo intente.
+        -- que solo admiten baja lógica, antes de que el usuario lo intente.
         (SELECT COUNT(*) FROM produccion pr
           WHERE pr.id_sku = s.id_sku
         ) AS total_producciones
     FROM sku_pt s
 `;
 
-const getSkus = async ({ turno = null, calidad = null, buscar = null } = {}) => {
+const getSkus = async ({
+    estado = null,
+    turno = null,
+    calidad = null,
+    buscar = null
+} = {}) => {
     const result = await db.query(
         `
         ${SELECT_SKU}
-        WHERE ($1::INT IS NULL OR s.turno = $1)
-          AND ($2::TEXT IS NULL OR s.calidad ILIKE '%' || $2 || '%')
-          AND ($3::TEXT IS NULL
-               OR s.codigo_sku ILIKE '%' || $3 || '%'
-               OR s.calidad ILIKE '%' || $3 || '%')
+        WHERE ($1::INT IS NULL OR s.estado = $1)
+          AND ($2::INT IS NULL OR s.turno = $2)
+          AND ($3::TEXT IS NULL OR s.calidad ILIKE '%' || $3 || '%')
+          AND ($4::TEXT IS NULL
+               OR s.codigo_sku ILIKE '%' || $4 || '%'
+               OR s.calidad ILIKE '%' || $4 || '%')
         ORDER BY s.codigo_sku, s.calidad
         `,
-        [turno, calidad, buscar]
+        [estado, turno, calidad, buscar]
     );
     return result.rows;
 };
@@ -68,6 +84,9 @@ const getSkuById = async (id_sku) => {
 // Duplicado por código + calidad, no solo por código.
 // El mismo empaque puede existir en PRIMERA y en SEGUNDA: son SKU distintos
 // y cada uno lleva su propio turno, así que generan lotes diferentes.
+//
+// v2.2: la BD ya tiene el índice único uq_sku_codigo_calidad. Esta consulta
+// se conserva para dar un mensaje claro antes de que reviente.
 const existeSku = async (codigo_sku, calidad, id_excluir = null) => {
     const result = await db.query(
         `
@@ -81,34 +100,52 @@ const existeSku = async (codigo_sku, calidad, id_excluir = null) => {
     return result.rows[0];
 };
 
-const createSku = async ({ codigo_sku, calidad, turno }) => {
+const createSku = async ({ codigo_sku, calidad, turno, estado }) => {
     const result = await db.query(
         `
-        INSERT INTO sku_pt (codigo_sku, calidad, turno)
-        VALUES ($1, $2, $3)
+        INSERT INTO sku_pt (codigo_sku, calidad, turno, estado)
+        VALUES ($1, $2, $3, $4)
         RETURNING *
         `,
-        [codigo_sku, calidad, turno]
+        [codigo_sku, calidad, turno, estado]
     );
     return result.rows[0];
 };
 
-const updateSku = async (id_sku, { codigo_sku, calidad, turno }) => {
+const updateSku = async (id_sku, { codigo_sku, calidad, turno, estado }) => {
     const result = await db.query(
         `
         UPDATE sku_pt
-        SET codigo_sku = $1, calidad = $2, turno = $3
-        WHERE id_sku = $4
+        SET codigo_sku = $1, calidad = $2, turno = $3, estado = $4
+        WHERE id_sku = $5
         RETURNING *
         `,
-        [codigo_sku, calidad, turno, id_sku]
+        [codigo_sku, calidad, turno, estado, id_sku]
     );
     return result.rows[0];
 };
 
-// sku_pt no tiene columna de estado, así que la única baja posible es el
-// borrado físico. Si alguna producción lo referencia, la FK lo impide
-// (error 23503) y el controller lo traduce a un mensaje entendible.
+// Baja LÓGICA (v2.2). Es la vía normal: el SKU deja de ofrecerse en los
+// dropdowns pero las producciones históricas siguen resolviendo su calidad.
+const bajaSku = async (id_sku) => {
+    const result = await db.query(
+        `UPDATE sku_pt SET estado = 0 WHERE id_sku = $1 RETURNING *`,
+        [id_sku]
+    );
+    return result.rows[0];
+};
+
+const reactivarSku = async (id_sku) => {
+    const result = await db.query(
+        `UPDATE sku_pt SET estado = 1 WHERE id_sku = $1 RETURNING *`,
+        [id_sku]
+    );
+    return result.rows[0];
+};
+
+// Borrado FÍSICO. Solo para corregir un alta mal capturada que nunca se
+// usó. Si alguna producción lo referencia, la FK lo impide (error 23503)
+// y el controller lo traduce a un mensaje entendible.
 const deleteSku = async (id_sku) => {
     const result = await db.query(
         `DELETE FROM sku_pt WHERE id_sku = $1 RETURNING *`,
@@ -134,6 +171,8 @@ const skuModel = {
     existeSku,
     createSku,
     updateSku,
+    bajaSku,
+    reactivarSku,
     deleteSku,
     getDependencias
 };

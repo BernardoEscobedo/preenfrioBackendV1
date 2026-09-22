@@ -7,6 +7,9 @@ import productoresModel from "../models/productores.model.js";
 // Catálogo sin alcance por cámara: una finca es el ORIGEN de la fruta, no su
 // destino. El recorte por planta empieza en producción y recepciones.
 //
+// v2.2: la comprobación del productor pasa de 'productor.activo' a
+// 'productor.estado'.
+//
 // El formato (zona válida, longitudes, normalización) lo resuelve
 // fincas.middleware.js. Aquí queda lo que exige consultar la BD: que el
 // productor exista y esté activo, y que el código no se repita dentro de él.
@@ -62,7 +65,7 @@ const createFinca = async (req, res) => {
 
         // No se permite colgar fincas nuevas de un productor dado de baja:
         // sería crear operación sobre algo que ya se cerró.
-        if (productor.activo === 0) {
+        if (productor.estado === 0) {
             return res.status(409).json({
                 error: `El productor "${productor.nombre}" está dado de baja. Reactívalo antes de darle fincas nuevas.`
             });
@@ -88,6 +91,15 @@ const createFinca = async (req, res) => {
         if (error.code === "23503") {
             return res.status(409).json({
                 error: "El productor indicado no existe"
+            });
+        }
+
+        // v2.2: la BD ahora tiene CHECK sobre la zona. No debería llegar
+        // aquí porque el middleware valida antes, pero si alguien consulta
+        // la API directo conviene explicar el motivo.
+        if (error.code === "23514") {
+            return res.status(400).json({
+                error: "Datos inválidos: la zona debe ser 1 (Chiapas), 2 (Colima) o 3 (Tabasco)"
             });
         }
 
@@ -141,6 +153,12 @@ const updateFinca = async (req, res) => {
         if (error.code === "23503") {
             return res.status(409).json({
                 error: "El productor indicado no existe"
+            });
+        }
+
+        if (error.code === "23514") {
+            return res.status(400).json({
+                error: "Datos inválidos: la zona debe ser 1 (Chiapas), 2 (Colima) o 3 (Tabasco)"
             });
         }
 

@@ -1,74 +1,159 @@
+import { db } from "../database/connection.database.js";
+
 // ============================================================================
-// VALIDACIONES DE SKU
+// PRODUCTORES
 // ============================================================================
-// El turno solo admite 1 o 2 porque es el ÚLTIMO dígito del código de lote,
-// que tiene una longitud fija de 15. Un 10 o un 0 romperían el formato y
-// los lotes dejarían de ser comparables entre sí.
+// Catálogo de origen. Es la base de 'fincas': una finca siempre pertenece a
+// un productor, y de ahí salen 2 de los 15 dígitos del código de lote.
 //
-// Código y calidad se guardan en mayúsculas: el catálogo se captura desde
-// varios lados (pantalla, importación del Excel) y sin normalizar acabarían
-// conviviendo "PRIMERA", "Primera" y "primera" como calidades distintas.
+// v2.2: la columna se llamaba 'activo'. Ahora es 'estado', igual que en
+// todo el esquema. Los valores no cambiaron: 1 = activo, 0 = dado de baja.
+//
+// SIN ALCANCE POR CÁMARA
+//   Un productor no pertenece a un preenfrío, así que este modelo no recibe
+//   el arreglo req.camaras. El recorte por cámara empieza en producción y
+//   recepciones, donde la fruta ya está físicamente en una planta.
+//
+// LA BAJA ES LÓGICA
+//   Nunca DELETE: fincas.id_productor y produccion.id_productor apuntan
+//   aquí. Borrar la fila dejaría lotes históricos sin su origen. Se marca
+//   estado = 0 y deja de ofrecerse en los selectores.
 // ============================================================================
 
-const TURNOS_VALIDOS = [1, 2];
-
-export const validarSku = (req, res, next) => {
-    const { codigo_sku, calidad, turno } = req.body;
-
-    // ---- Código ----
-    if (!codigo_sku || typeof codigo_sku !== "string" || codigo_sku.trim() === "") {
-        return res.status(400).json({
-            error: 'El campo "codigo_sku" es obligatorio'
-        });
-    }
-
-    const codigo = codigo_sku.trim().toUpperCase();
-
-    if (codigo.length > 10) {
-        return res.status(400).json({
-            error: 'El campo "codigo_sku" no puede exceder 10 caracteres'
-        });
-    }
-
-    // ---- Calidad ----
-    if (!calidad || typeof calidad !== "string" || calidad.trim() === "") {
-        return res.status(400).json({
-            error: 'El campo "calidad" es obligatorio (ej. PRIMERA, SEGUNDA)'
-        });
-    }
-
-    if (calidad.length > 70) {
-        return res.status(400).json({
-            error: 'El campo "calidad" no puede exceder 70 caracteres'
-        });
-    }
-
-    // ---- Turno ----
-    // La BD tiene DEFAULT 1, así que se respeta ese criterio cuando no viene.
-    const turnoNum = turno === undefined || turno === null ? 1 : Number(turno);
-
-    if (!TURNOS_VALIDOS.includes(turnoNum)) {
-        return res.status(400).json({
-            error: 'El campo "turno" debe ser 1 o 2 (es el último dígito del código de lote)'
-        });
-    }
-
-    // Normalización
-    req.body.codigo_sku = codigo;
-    req.body.calidad = calidad.trim().toUpperCase();
-    req.body.turno = turnoNum;
-
-    next();
+// Lista con el conteo de fincas, para que la pantalla muestre de un vistazo
+// qué productores tienen operación y cuáles quedaron vacíos.
+//
+// Los filtros son opcionales. El patrón ($1::INT IS NULL OR ...) evita
+// armar SQL dinámico: si el parámetro llega NULL la condición se cumple
+// siempre y la misma query sirve para todos los casos.
+const getProductores = async ({ estado = null, buscar = null } = {}) => {
+    const result = await db.query(
+        `
+        SELECT
+            p.*,
+            (SELECT COUNT(*) FROM fincas f
+              WHERE f.id_productor = p.id_productor
+            ) AS total_fincas
+        FROM productores p
+        WHERE ($1::INT IS NULL OR p.estado = $1)
+          AND ($2::TEXT IS NULL
+               OR p.codigo_productor ILIKE '%' || $2 || '%'
+               OR p.nombre ILIKE '%' || $2 || '%')
+        ORDER BY p.codigo_productor
+        `,
+        [estado, buscar]
+    );
+    return result.rows;
 };
 
-export const validarIdSku = (req, res, next) => {
-    const { id } = req.params;
-
-    if (!id || isNaN(Number(id))) {
-        return res.status(400).json({
-            error: "El id de SKU debe ser un número válido"
-        });
-    }
-
-    next();
+const getProductorById = async (id_productor) => {
+    const result = await db.query(
+        `SELECT * FROM productores WHERE id_productor = $1`,
+        [id_productor]
+    );
+    return result.rows[0];
 };
+
+// Verifica si un código ya está en uso.
+// Se consulta antes de insertar para dar un mensaje claro en vez de dejar
+// que reviente el índice UNIQUE.
+//
+// Al editar se excluye el propio id, para que guardar sin cambiar el
+// código no marque conflicto consigo mismo.
+const existeCodigo = async (codigo_productor, id_excluir = null) => {
+    const result = await db.query(
+        `
+        SELECT id_productor, nombre FROM productores
+        WHERE UPPER(codigo_productor) = UPPER($1)
+          AND ($2::INT IS NULL OR id_productor <> $2)
+        `,
+        [codigo_productor, id_excluir]
+    );
+    return result.rows[0];
+};
+
+const createProductor = async ({ codigo_productor, nombre, estado }) => {
+    const result = await db.query(
+        `
+        INSERT INTO productores (codigo_productor, nombre, estado)
+        VALUES ($1, $2, $3)
+        RETURNING *
+        `,
+        [codigo_productor, nombre, estado]
+    );
+    return result.rows[0];
+};
+
+// Actualiza las tres columnas siempre: el middleware ya garantizó que
+// vengan completas y normalizadas. Un UPDATE parcial con COALESCE haría
+// imposible distinguir "no lo mandes" de "ponlo en cero".
+const updateProductor = async (
+    id_productor,
+    { codigo_productor, nombre, estado }
+) => {
+    const result = await db.query(
+        `
+        UPDATE productores
+        SET codigo_productor = $1, nombre = $2, estado = $3
+        WHERE id_productor = $4
+        RETURNING *
+        `,
+        [codigo_productor, nombre, estado, id_productor]
+    );
+    return result.rows[0];
+};
+
+// Baja lógica. El histórico de fincas y producción se conserva intacto.
+const bajaProductor = async (id_productor) => {
+    const result = await db.query(
+        `
+        UPDATE productores SET estado = 0
+        WHERE id_productor = $1
+        RETURNING *
+        `,
+        [id_productor]
+    );
+    return result.rows[0];
+};
+
+const reactivarProductor = async (id_productor) => {
+    const result = await db.query(
+        `
+        UPDATE productores SET estado = 1
+        WHERE id_productor = $1
+        RETURNING *
+        `,
+        [id_productor]
+    );
+    return result.rows[0];
+};
+
+// Qué queda colgando si se da de baja.
+// El controller lo devuelve como aviso: el usuario merece saber que sus
+// fincas siguen ahí y que las producciones viejas no se tocan.
+const getDependencias = async (id_productor) => {
+    const result = await db.query(
+        `
+        SELECT
+            (SELECT COUNT(*) FROM fincas
+              WHERE id_productor = $1) AS fincas,
+            (SELECT COUNT(*) FROM produccion
+              WHERE id_productor = $1) AS producciones
+        `,
+        [id_productor]
+    );
+    return result.rows[0];
+};
+
+const productoresModel = {
+    getProductores,
+    getProductorById,
+    existeCodigo,
+    createProductor,
+    updateProductor,
+    bajaProductor,
+    reactivarProductor,
+    getDependencias
+};
+
+export default productoresModel;

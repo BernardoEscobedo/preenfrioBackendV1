@@ -12,24 +12,35 @@ const router = Router();
 
 // ============================================================================
 // SKU DE PRODUCTO TERMINADO
-// ver = operativo+ · crear/editar = coordinador+ · eliminar = admin
+// ver = operativo+ · crear/editar/baja = coordinador+ · eliminar = admin
 // ============================================================================
-// ELIMINAR sube a admin porque es el único catálogo del bloque cuya baja es
-// FÍSICA: sku_pt no tiene columna de estado. El controller ya bloquea el
-// borrado si hay producciones ligadas, pero el guard añade una segunda
-// barrera sobre una acción irreversible.
+// v2.2 · SE SEPARAN LAS DOS BAJAS
+//   DELETE /:id           baja LÓGICA (estado = 0)  → coordinador+
+//   DELETE /:id/eliminar  borrado FÍSICO            → admin
 //
-// CAMPO CALCULADO EN LA RESPUESTA
-//   Cada SKU trae "cajas_por_tarima": 42 en la familia CPL0813, 48 en el
-//   resto. Se calcula en el modelo para que el dashboard, el frontend y la
-//   importación del Excel usen el mismo criterio sin replicar la regla.
+//   Antes solo existía el borrado físico y quedaba bloqueado en cuanto
+//   alguna producción usara el SKU, que en la práctica es siempre. Ahora
+//   descontinuar un empaque es una operación normal de coordinación, y el
+//   borrado real queda para corregir altas mal capturadas que nunca se
+//   usaron. Dos rutas distintas para que una acción irreversible no
+//   comparta botón con una reversible.
 //
-//   También trae "total_producciones": la pantalla lo usa para deshabilitar
-//   el botón de borrar antes de que el usuario lo intente.
+// CAMPOS CALCULADOS EN LA RESPUESTA
+//   "cajas_por_tarima": 42 en la familia CPL0813, 48 en el resto. Se calcula
+//   en el modelo para que el dashboard, el frontend y la importación del
+//   Excel usen el mismo criterio sin replicar la regla.
+//
+//   "total_producciones": la pantalla lo usa para saber si un SKU admite
+//   borrado físico o solo baja lógica.
+//
+// FILTROS DEL LISTADO
+//   ?estado=1         solo activos (para dropdowns)
+//   ?turno=1          1 o 2
+//   ?calidad=PRIMERA  coincidencia parcial
+//   ?buscar=texto     código o calidad
 // ============================================================================
 
 // ---- Consultas ----
-// Filtros: ?turno=1 · ?calidad=PRIMERA · ?buscar=texto
 router.get("/", verifyToken, verifyOperativo, skuController.getSkus);
 
 router.get("/:id", verifyToken, verifyOperativo, validarIdSku, skuController.getSkuById);
@@ -41,8 +52,13 @@ router.post("/", verifyToken, verifyCoordinador, validarSku, skuController.creat
 
 router.put("/:id", verifyToken, verifyCoordinador, validarIdSku, validarSku, skuController.updateSku);
 
-// ---- Baja ----
-// FÍSICA. El controller verifica dependencias antes de ejecutarla.
-router.delete("/:id", verifyToken, verifyAdmin, validarIdSku, skuController.deleteSku);
+// ---- Baja lógica (vía normal) ----
+router.delete("/:id", verifyToken, verifyCoordinador, validarIdSku, skuController.bajaSku);
+
+router.patch("/:id/reactivar", verifyToken, verifyCoordinador, validarIdSku, skuController.reactivarSku);
+
+// ---- Borrado físico (excepcional) ----
+// Solo admin. El controller lo rechaza si hay producciones ligadas.
+router.delete("/:id/eliminar", verifyToken, verifyAdmin, validarIdSku, skuController.deleteSku);
 
 export default router;
