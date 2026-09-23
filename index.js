@@ -24,6 +24,9 @@ import skuRouter from "./routes/sku.route.js";
 import cedisRouter from "./routes/cedis.route.js";
 import transportesRouter from "./routes/transportes.route.js";
 
+// ---- Bloque 5 · Producción ----
+import produccionRouter from "./routes/produccion.route.js";
+
 
 dotenv.config();
 
@@ -94,6 +97,7 @@ app.use(`${API}/fincas`, fincasRouter);
 app.use(`${API}/sku`, skuRouter);
 app.use(`${API}/cedis`, cedisRouter);
 app.use(`${API}/transportes`, transportesRouter);
+app.use(`${API}/produccion`, produccionRouter);
 
 
 // Salud del servicio: sirve para verificar que responde sin tocar la BD.
