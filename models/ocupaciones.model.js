@@ -11,6 +11,19 @@ import { db } from "../database/connection.database.js";
 //   fn_promover_de_cola     mueve fruta de la cola hacia la cámara
 //   fn_set_prioridad_cola   adelanta un proceso urgente en la fila
 //
+// v2.3 · CRITICIDAD POR HOLGURA
+//   La cola ya no ordena solo por antigüedad. Ahora cada fila trae:
+//
+//       holgura_dias       días de margen antes de incumplir la cita
+//                          (días para la cita − tránsito − preenfrío)
+//       nivel_criticidad   1 CRÍTICA · 2 URGENTE · 3 NORMAL · 4 HOLGADA
+//       criticidad_texto   la etiqueta para la pantalla
+//       motivo_criticidad  por qué quedó en ese nivel
+//
+//   El cálculo vive en las vistas (vw_cola_espera, vw_inventario_disponible)
+//   y no aquí, para que el dashboard, el picking y este módulo no lleguen a
+//   números distintos. Si cambia la regla, se cambia en un solo lugar.
+//
 // ⚠️ POR QUÉ SE LLAMAN FUNCIONES Y NO SE ESCRIBE UPDATE AQUÍ
 //   Promover de la cola son cinco pasos encadenados: verificar espacio,
 //   calcular cuántas tarimas caben, repartir las cajas en proporción, sumar
@@ -25,19 +38,18 @@ import { db } from "../database/connection.database.js";
 // LAS FUNCIONES DEVUELVEN TEXTO, NO EXCEPCIONES
 //   Regresan 'OK: ...' o el motivo del rechazo ('La cámara no tiene espacio
 //   disponible'). No lanzan error, así que el controller tiene que LEER la
-//   respuesta para saber si funcionó. Es un detalle fácil de pasar por alto
-//   y por eso este modelo lo deja explícito en el valor de retorno.
+//   respuesta para saber si funcionó.
 // ============================================================================
 
 // ----------------------------------------------------------------------------
 // Tablero de ocupación por cámara
 // ----------------------------------------------------------------------------
-// Lee vw_disponibilidad_camaras, que ya calcula ocupado, en espera, libre y
-// estado de mantenimiento. Es la pantalla principal del módulo.
+// Lee vw_disponibilidad_camaras y le agrega el pendiente crítico: cuántas
+// tarimas de nivel 1 están esperando en cada cámara.
 //
-// La vista incluye cámaras dadas de baja a propósito: si quedó inventario
-// dentro hay que poder verlo para vaciarlas. El filtro de operativas se
-// aplica aquí, como parámetro opcional.
+// Ese dato es el que convierte el tablero en accionable. Sin él, una cámara
+// al 95% y otra al 95% se ven igual; con él se distingue la que tiene tres
+// lotes con la cita encima de la que solo tiene fruta holgada esperando.
 const getTablero = async (
     { tipo_camara = null, solo_operativas = false } = {},
     camaras = null
@@ -61,13 +73,33 @@ const getTablero = async (
                 WHEN 1 THEN 'Preenfrío'
                 WHEN 2 THEN 'Conservación'
                 ELSE 'Otra'
-            END AS tipo_camara_texto
+            END AS tipo_camara_texto,
+            -- v2.3 · Presión de la cola: lo que no puede esperar
+            COALESCE(crit.tarimas_criticas, 0)  AS tarimas_criticas_en_cola,
+            COALESCE(crit.procesos_criticos, 0) AS procesos_criticos_en_cola,
+            crit.holgura_minima
         FROM vw_disponibilidad_camaras v
         JOIN camaras cam ON cam.id_camara = v.id_camara
+        LEFT JOIN (
+            SELECT
+                id_camara,
+                SUM(tarimas_en_espera) FILTER (WHERE nivel_criticidad = 1)
+                    AS tarimas_criticas,
+                COUNT(*) FILTER (WHERE nivel_criticidad = 1)
+                    AS procesos_criticos,
+                MIN(holgura_dias) AS holgura_minima
+            FROM vw_cola_espera
+            GROUP BY id_camara
+        ) crit ON crit.id_camara = v.id_camara
         WHERE ($1::INT IS NULL OR v.tipo_camara = $1)
           AND ($2::INT[] IS NULL OR v.id_camara = ANY($2))
           AND ($3::BOOLEAN IS FALSE OR v.estado = 1)
-        ORDER BY v.tipo_camara, v.nombre_camara
+        ORDER BY
+            -- Las cámaras con fruta crítica esperando van arriba: es donde
+            -- hay que actuar primero.
+            COALESCE(crit.procesos_criticos, 0) DESC,
+            v.tipo_camara,
+            v.nombre_camara
         `,
         [tipo_camara, camaras, solo_operativas]
     );
@@ -77,23 +109,78 @@ const getTablero = async (
 // ----------------------------------------------------------------------------
 // Cola de espera
 // ----------------------------------------------------------------------------
-// Lee vw_cola_espera, que ya trae la posición calculada con ROW_NUMBER y el
-// orden que manda en el negocio:
+// Lee vw_cola_espera, que ya trae 'posicion' calculada con el orden que
+// manda en el negocio (v2.3):
 //
-//   1º prioridad DESC     → los urgentes al frente
-//   2º fecha_empaque ASC  → la fruta más VIEJA entra primero
-//   3º fecha/hora llegada → desempate
+//   1º prioridad DESC        override manual del supervisor
+//   2º nivel_criticidad ASC  la holgura contra la cita
+//   3º fecha_empaque ASC     FEFO dentro del mismo nivel
+//   4º llegada               desempate
 //
-// 'posicion' es el turno dentro de cada cámara: 1 = el siguiente en entrar.
-const getCola = async ({ id_camara = null } = {}, camaras = null) => {
+// El filtro por nivel permite que la pantalla muestre "solo lo crítico",
+// que es lo que el supervisor quiere ver cuando llega en la mañana.
+const getCola = async (
+    { id_camara = null, nivel_maximo = null } = {},
+    camaras = null
+) => {
     const result = await db.query(
         `
         SELECT * FROM vw_cola_espera
         WHERE ($1::INT IS NULL OR id_camara = $1)
           AND ($2::INT[] IS NULL OR id_camara = ANY($2))
+          AND ($3::INT IS NULL OR nivel_criticidad <= $3)
         ORDER BY id_camara, posicion
         `,
-        [id_camara, camaras]
+        [id_camara, camaras, nivel_maximo]
+    );
+    return result.rows;
+};
+
+// ----------------------------------------------------------------------------
+// Lo que no puede esperar — reporte de arranque de turno
+// ----------------------------------------------------------------------------
+// Solo nivel 1, de TODAS las cámaras del alcance, ordenado por lo peor
+// primero. Es la consulta que responde "¿qué se me está incumpliendo?".
+//
+// Separa los dos motivos de criticidad, porque exigen acciones distintas:
+//   · holgura ≤ 0        → hay que despachar YA
+//   · fruta muy vieja    → hay que revisar calidad, quizá ya no sirve
+const getCriticas = async (camaras = null) => {
+    const result = await db.query(
+        `
+        SELECT
+            id_ocupacion,
+            id_camara,
+            nombre_camara,
+            posicion,
+            codigo_lote,
+            cliente,
+            cedis,
+            tarimas_en_espera,
+            fecha_empaque,
+            dias_desde_empaque,
+            fecha_entrega,
+            dias_para_cita,
+            transito,
+            holgura_dias,
+            criticidad_texto,
+            motivo_criticidad,
+            prioridad,
+            motivo_prioridad,
+            -- Distingue el origen de la criticidad para saber qué hacer
+            CASE
+                WHEN holgura_dias IS NOT NULL AND holgura_dias < 0
+                    THEN 'CITA_VENCIDA'
+                WHEN holgura_dias = 0
+                    THEN 'SALE_HOY'
+                ELSE 'FRUTA_VIEJA'
+            END AS tipo_criticidad
+        FROM vw_cola_espera
+        WHERE nivel_criticidad = 1
+          AND ($1::INT[] IS NULL OR id_camara = ANY($1))
+        ORDER BY holgura_dias ASC NULLS LAST, dias_desde_empaque DESC
+        `,
+        [camaras]
     );
     return result.rows;
 };
@@ -105,10 +192,11 @@ const getCola = async ({ id_camara = null } = {}, camaras = null) => {
 // está REALMENTE dentro. La cola no aparece porque no se puede despachar
 // fruta que todavía está en el patio.
 //
-// Ordenado FEFO (la más vieja primero): es la fuente del picking de
-// despachos y el orden en que debería salir.
+// v2.3: el orden ya no es FEFO puro, es criticidad y luego FEFO. Ordenar
+// solo por antigüedad provocaba el error inverso al de la cola: sacar
+// fruta vieja con cita lejana y dejar adentro la que vence mañana.
 const getInventario = async (
-    { id_camara = null, id_cc = null, buscar = null } = {},
+    { id_camara = null, id_cc = null, nivel_maximo = null, buscar = null } = {},
     camaras = null
 ) => {
     const result = await db.query(
@@ -117,13 +205,13 @@ const getInventario = async (
         WHERE ($1::INT IS NULL OR id_camara = $1)
           AND ($2::INT IS NULL OR id_cc = $2)
           AND ($3::INT[] IS NULL OR id_camara = ANY($3))
-          AND ($4::TEXT IS NULL
-               OR codigo_lote ILIKE '%' || $4 || '%'
-               OR nombre_finca ILIKE '%' || $4 || '%'
-               OR cliente ILIKE '%' || $4 || '%')
-        ORDER BY dias_desde_empaque DESC NULLS LAST, id_ocupacion
+          AND ($4::INT IS NULL OR nivel_criticidad <= $4)
+          AND ($5::TEXT IS NULL
+               OR codigo_lote ILIKE '%' || $5 || '%'
+               OR nombre_finca ILIKE '%' || $5 || '%'
+               OR cliente ILIKE '%' || $5 || '%')
         `,
-        [id_camara, id_cc, camaras, buscar]
+        [id_camara, id_cc, camaras, nivel_maximo, buscar]
     );
     return result.rows;
 };
@@ -158,6 +246,17 @@ const getOcupacionById = async (id_ocupacion) => {
             p.semana,
             p.fecha_empaque,
             (CURRENT_DATE - p.fecha_empaque) AS dias_desde_empaque,
+            p.fecha_entrega,
+            (p.fecha_entrega - CURRENT_DATE) AS dias_para_cita,
+            COALESCE(p.transito, 0) AS transito,
+            -- Misma fórmula que las vistas: días de margen antes de
+            -- incumplir la cita
+            CASE
+                WHEN p.fecha_entrega IS NULL THEN NULL
+                ELSE (p.fecha_entrega - CURRENT_DATE)
+                     - COALESCE(p.transito, 0)
+                     - 1
+            END AS holgura_dias,
             f.codigo_finca,
             f.nombre  AS nombre_finca,
             pr.nombre AS nombre_productor,
@@ -187,6 +286,9 @@ const getOcupacionById = async (id_ocupacion) => {
 // CUÁNTAS tarimas, porque él ve el patio: sabe cuál camión está estorbando
 // el andén y cuál fruta se ve peor.
 //
+// La vista SUGIERE el orden con 'posicion' y ahora ese orden ya considera
+// la cita, no solo la antigüedad. El sistema recomienda; la persona decide.
+//
 // La función se encarga de no exceder ni lo que espera ni lo que cabe:
 //     v_tar := LEAST(p_tarimas, v_tar_espera, v_disp)
 //
@@ -208,15 +310,16 @@ const promoverDeCola = async (id_ocupacion, tarimas, fecha = null, hora = null) 
 // ----------------------------------------------------------------------------
 // fn_set_prioridad_cola — adelantar o regresar un proceso en la fila
 // ----------------------------------------------------------------------------
-//   prioridad = 0  → orden normal (por fecha de empaque)
+//   prioridad = 0  → orden normal (por criticidad y luego antigüedad)
 //   prioridad > 0  → urgente; a mayor número, más al frente
 //
-// Solo aplica a filas tipo_ocupacion = 3. La función rechaza cualquier otra
-// cosa con un mensaje, no con un error.
+// v2.3: la prioridad manual sigue ganando sobre TODO, incluida la
+// criticidad. Es intencional: el supervisor a veces sabe algo que el
+// sistema no puede calcular (un cliente llamando, un camión ya en el
+// andén, un cambio de cita que aún no se captura).
 //
-// El motivo solo se guarda si hay prioridad: la propia función lo pone en
-// NULL cuando se regresa a 0, para que no quede un "URGENTE CLIENTE X"
-// colgando de algo que ya no es urgente.
+// Con la criticidad automática debería necesitarse mucho menos que antes:
+// los casos que antes se resolvían a mano ahora salen solos en el orden.
 const setPrioridad = async (id_ocupacion, prioridad, motivo = null) => {
     const result = await db.query(
         `SELECT fn_set_prioridad_cola($1, $2, $3) AS resultado`,
@@ -262,8 +365,18 @@ const getHistorial = async (
             END AS horas_en_camara,
             o.observaciones,
             p.codigo_lote,
+            p.fecha_entrega,
             f.nombre  AS nombre_finca,
-            cc.cliente
+            cc.cliente,
+            -- Cumplimiento: si salió después de la cita, se incumplió.
+            -- Es el indicador que cierra el ciclo y permite medir si la
+            -- criticidad está funcionando.
+            CASE
+                WHEN p.fecha_entrega IS NULL THEN NULL
+                WHEN o.fecha_fin IS NULL THEN NULL
+                WHEN o.fecha_fin <= p.fecha_entrega THEN TRUE
+                ELSE FALSE
+            END AS cumplio_cita
         FROM ocupaciones_camaras o
         JOIN camaras            c   ON c.id_camara     = o.id_camara
         LEFT JOIN recepciones   r   ON r.id_recepcion  = o.id_recepcion
@@ -286,6 +399,7 @@ const getHistorial = async (
 const ocupacionesModel = {
     getTablero,
     getCola,
+    getCriticas,
     getInventario,
     getOcupacionById,
     promoverDeCola,
