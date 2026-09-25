@@ -10,14 +10,26 @@ import camarasModel from "../models/camaras.model.js";
 //     [...] -> Supervisor / Operativo
 //
 // ⚠️ ESTE CONTROLLER NO TOCA ocupaciones_camaras
-//   El INSERT en recepciones dispara los triggers que reparten la fruta
-//   entre la cámara y la cola. Aquí solo se valida ANTES y se informa
-//   DESPUÉS de lo que hicieron.
+//   El INSERT dispara los triggers que reparten la fruta entre la cámara y
+//   la cola. Aquí solo se valida ANTES y se informa DESPUÉS.
 //
-//   Por eso createRecepcion relee las ocupaciones generadas al final: es la
-//   única forma honesta de decirle al operador "entraron 15 tarimas y 5
-//   quedaron en cola", sin duplicar en JavaScript el cálculo que ya hizo la
-//   BD (y arriesgarse a que un día dejen de coincidir).
+// ────────────────────────────────────────────────────────────────────────
+// v2.5 · CANCELAR AHORA SÍ LIBERA LA CÁMARA
+// ────────────────────────────────────────────────────────────────────────
+//   Hasta la v2.4, trg_sync_ocupacion_recepcion era AFTER INSERT: cancelar
+//   una recepción cambiaba su estado pero dejaba la fruta contada dentro.
+//   Este controller advertía de eso en la respuesta.
+//
+//   La v2.5 agregó trg_revertir_recepcion (AFTER UPDATE), que descuenta lo
+//   que esa recepción metió y cierra su fila de cola. Los mensajes se
+//   actualizaron: antes decían "la cancelación NO libera la cámara", que
+//   ahora es falso.
+//
+//   Queda un caso que SÍ hay que seguir avisando: si parte de esa fruta ya
+//   se movió a conservación o ya se despachó, la cámara solo puede
+//   descontar lo que todavía tiene. El trigger corta con GREATEST(x, 0)
+//   para no dejar el inventario en negativo, y aquí se detecta comparando
+//   antes y después.
 // ============================================================================
 
 // GET /api/preenfrio/recepciones?id_produccion=5&estado=1
@@ -154,8 +166,7 @@ const createRecepcion = async (req, res) => {
             id_produccion,
             id_camara,
             tarimas_recibidas,
-            cajas_recibidas,
-            tarimas_ingresadas
+            cajas_recibidas
         } = req.body;
 
         // ---- La producción existe y se puede recibir ----
@@ -299,9 +310,15 @@ const createRecepcion = async (req, res) => {
 // ----------------------------------------------------------------------------
 // PUT /api/preenfrio/recepciones/:id
 // ----------------------------------------------------------------------------
-// Solo temperatura y observaciones. Las cantidades NO se editan: el trigger
-// que reparte la fruta es AFTER INSERT y no revertiría la ocupación ya
-// creada, así que un UPDATE dejaría el inventario descuadrado en silencio.
+// Solo temperatura y observaciones.
+//
+// Las cantidades NO se editan, y esto sigue vigente en la v2.5: el trigger
+// nuevo reacciona al cambio de ESTADO, no a un cambio de cantidades. Un
+// UPDATE de tarimas_recibidas movería el número en la tabla sin tocar la
+// ocupación.
+//
+// Para corregir un número hay que cancelar y volver a capturar — y ahora
+// eso sí devuelve la capacidad.
 const updateRecepcion = async (req, res) => {
     try {
         const { id } = req.params;
@@ -344,12 +361,21 @@ const updateRecepcion = async (req, res) => {
 // ----------------------------------------------------------------------------
 // DELETE /api/preenfrio/recepciones/:id
 // ----------------------------------------------------------------------------
-// Cancelación (estado = 0). Dispara trg_actualizar_estado_produccion, que
-// solo suma las activas, así que la producción recalcula su estado sola.
+// Cancelación (estado = 0). Dispara DOS triggers:
 //
-// ⚠️ NO devuelve las tarimas de la cámara: trg_sync_ocupacion_recepcion es
-// AFTER INSERT y no se dispara al cancelar. Se avisa explícitamente para
-// que el supervisor ajuste el inventario.
+//   trg_actualizar_estado_produccion  recalcula el estado de la producción
+//                                     (solo suma las recepciones activas)
+//
+//   trg_revertir_recepcion  ⭐ v2.5   descuenta de la cámara lo que esta
+//                                     recepción metió y cierra su fila de
+//                                     cola
+//
+// El segundo es nuevo. Antes la cámara se quedaba con la fruta contada y
+// este controller lo advertía; ahora se libera sola.
+//
+// Lo que SÍ hay que seguir avisando: si parte de esa fruta ya se movió o se
+// despachó, la cámara solo descuenta lo que todavía tiene. Se detecta
+// comparando el inventario antes y después.
 const cancelarRecepcion = async (req, res) => {
     try {
         const { id } = req.params;
@@ -376,28 +402,60 @@ const cancelarRecepcion = async (req, res) => {
             });
         }
 
-        const ocupaciones = await recepcionesModel.getOcupacionesGeneradas(id);
-        const activas = ocupaciones.filter((o) => o.estado === 1);
+        // Foto ANTES de cancelar: es contra esto que se compara para saber
+        // cuánto pudo devolver realmente el trigger.
+        const antes = existente.id_camara
+            ? await recepcionesModel.getDisponibilidad(existente.id_camara)
+            : null;
 
         const recepcion = await recepcionesModel.cancelarRecepcion(id);
 
-        // El aviso es la parte importante de esta respuesta: sin él, alguien
-        // podría creer que cancelar vació la cámara.
+        // ---- Qué liberó el trigger ----
+        const despues = existente.id_camara
+            ? await recepcionesModel.getDisponibilidad(existente.id_camara)
+            : null;
+
+        const esperaba = Number(existente.tarimas_ingresadas ?? 0);
+        const liberadas =
+            antes && despues
+                ? Number(despues.tarimas_disponibles) -
+                  Number(antes.tarimas_disponibles)
+                : 0;
+
         const avisos = [];
 
-        if (activas.length > 0) {
-            const tarimas = activas.reduce(
-                (suma, o) => suma + Number(o.cantidad_tarimas), 0
-            );
+        // El caso que sigue necesitando advertencia: la fruta ya no estaba
+        // toda en la cámara.
+        if (existente.id_camara && liberadas < esperaba) {
             avisos.push(
-                `La cancelación NO libera la cámara automáticamente: siguen ${tarimas} tarima(s) registradas en "${existente.nombre_camara}" por esta recepción. Ajústalas con un movimiento de inventario.`
+                `⚠️ Esta recepción metió ${esperaba} tarima(s) pero solo se liberaron ${liberadas}: el resto ya se había movido a conservación o despachado. Revisa el inventario de "${existente.nombre_camara}".`
             );
+        }
+
+        let resultado;
+
+        if (!existente.id_camara) {
+            resultado = "Recepción cancelada. No ocupaba cámara (CEDA directo).";
+        } else if (liberadas > 0) {
+            resultado = `Se liberaron ${liberadas} tarima(s) en "${existente.nombre_camara}".`;
+        } else if (esperaba === 0) {
+            resultado = `Recepción cancelada. No había fruta dentro de la cámara que liberar.`;
+        } else {
+            resultado = `Recepción cancelada, pero la cámara no cambió: esa fruta ya no estaba ahí.`;
         }
 
         res.status(200).json({
             mensaje: "Recepción cancelada. El estado de la producción se recalculó.",
+            resultado,
             recepcion,
-            ocupaciones_pendientes: activas,
+            capacidad: despues
+                ? {
+                      camara: existente.nombre_camara,
+                      antes: Number(antes.tarimas_disponibles),
+                      despues: Number(despues.tarimas_disponibles),
+                      liberadas
+                  }
+                : null,
             avisos
         });
     } catch (error) {
@@ -406,7 +464,19 @@ const cancelarRecepcion = async (req, res) => {
     }
 };
 
+// ----------------------------------------------------------------------------
 // PATCH /api/preenfrio/recepciones/:id/reactivar
+// ----------------------------------------------------------------------------
+// v2.5: trg_revertir_recepcion también cubre el camino de vuelta (0 → 1) y
+// regenera la ocupación.
+//
+// ⚠️ Con una diferencia que SÍ hay que advertir: al reactivar, la fruta que
+// originalmente quedó EN COLA se suma directo a la cámara. El trigger no
+// puede reconstruir la fila de cola porque ya no se sabe si sigue habiendo
+// espacio ni cuál era su lugar en el orden.
+//
+// En la práctica significa que una cámara puede quedar sobreocupada tras
+// reactivar una recepción que había desbordado.
 const reactivarRecepcion = async (req, res) => {
     try {
         const { id } = req.params;
@@ -433,14 +503,46 @@ const reactivarRecepcion = async (req, res) => {
             });
         }
 
+        const antes = existente.id_camara
+            ? await recepcionesModel.getDisponibilidad(existente.id_camara)
+            : null;
+
         const recepcion = await recepcionesModel.reactivarRecepcion(id);
+
+        const despues = existente.id_camara
+            ? await recepcionesModel.getDisponibilidad(existente.id_camara)
+            : null;
+
+        const avisos = [];
+
+        // Había desbordado: lo que estaba en cola ahora entra a la cámara
+        if (Number(existente.tarimas_en_cola) > 0) {
+            avisos.push(
+                `Esta recepción tenía ${existente.tarimas_en_cola} tarima(s) en cola. Al reactivar, todo se suma a la cámara: la fila de espera no se reconstruye porque ya no se conoce su lugar en el orden.`
+            );
+        }
+
+        // La cámara quedó sobreocupada
+        if (despues && Number(despues.tarimas_disponibles) < 0) {
+            avisos.push(
+                `⚠️ "${existente.nombre_camara}" quedó sobreocupada: ${despues.tarimas_ocupadas} tarimas contra una capacidad de ${despues.capacidad_max_tarimas}. Mueve fruta a conservación o despáchala.`
+            );
+        }
 
         res.status(200).json({
             mensaje: "Recepción reactivada. El estado de la producción se recalculó.",
+            resultado: existente.id_camara
+                ? `Se ocuparon de nuevo ${existente.tarimas_ingresadas ?? 0} tarima(s) en "${existente.nombre_camara}".`
+                : "Recepción reactivada. No ocupaba cámara (CEDA directo).",
             recepcion,
-            avisos: [
-                "Reactivar NO regenera las ocupaciones de cámara. Verifica el inventario si se habían ajustado a mano."
-            ]
+            capacidad: despues
+                ? {
+                      camara: existente.nombre_camara,
+                      antes: Number(antes.tarimas_disponibles),
+                      despues: Number(despues.tarimas_disponibles)
+                  }
+                : null,
+            avisos
         });
     } catch (error) {
         console.error("Error al reactivar la recepcion:", error);

@@ -2,6 +2,7 @@ import { Router } from "express";
 import { movimientosController } from "../controllers/movimientos.controller.js";
 import {
     validarMovimiento,
+    validarReversa,
     validarIdMovimiento
 } from "../middlewares/movimientos.middleware.js";
 import {
@@ -19,17 +20,13 @@ const router = Router();
 
 // ============================================================================
 // MOVIMIENTOS DE INVENTARIO
-// ver = operativo+ · trasladar = supervisor+ · eliminar = admin
+// ver = operativo+ · trasladar/revertir = supervisor+ · eliminar = admin
 // ============================================================================
 // Bitácora del flujo físico entre cámaras.
 //
 //   tipo 1 = ingreso a preenfrío        lo genera la recepción
 //   tipo 2 = preenfrío → conservación   ← lo ÚNICO que crea este módulo
 //   tipo 3 = salida por despacho        lo genera el detalle de despachos
-//
-//   Los tipos 1 y 3 no se pueden capturar a mano desde aquí: habría dos
-//   vías para el mismo hecho y la cámara terminaría con el doble de fruta.
-//   El middleware lo bloquea.
 //
 // ---- EL ALCANCE, EN TRES PUNTOS ----
 //   Es el primer módulo donde hay que validar DOS cámaras.
@@ -44,26 +41,37 @@ const router = Router();
 //       "id_camara_destino")               viene en el body.
 //
 //   El controller valida la cámara ORIGEN, que NO viene en el body: se
-//   deduce de id_ocupacion_origen. Sin esa tercera validación, un
-//   supervisor podría sacar fruta de una planta ajena mandando una
-//   ocupación que no le corresponde.
+//   deduce de id_ocupacion_origen.
 //
-// POR QUÉ TRASLADAR ES SUPERVISOR Y NO OPERATIVO
-//   A diferencia de recepcionar o promover de la cola, aquí se decide que
-//   la fruta YA TERMINÓ su ciclo de preenfrío. Sacarla antes de tiempo la
-//   manda caliente a conservación y compromete la calidad de todo el lote.
-//   Es criterio técnico, no ejecución.
+// ────────────────────────────────────────────────────────────────────────
+// v2.5 · DOS VÍAS DE CORRECCIÓN, Y NO SON EQUIVALENTES
+// ────────────────────────────────────────────────────────────────────────
+//   POST /:id/revertir   ← LA VÍA OFICIAL. supervisor+
+//       Crea un movimiento inverso. El inventario queda igual que si se
+//       hubiera borrado, pero la bitácora conserva las dos filas: el
+//       traslado y su corrección, con fecha, usuario y motivo.
 //
-// POR QUÉ ELIMINAR ES ADMIN
-//   La tabla es una bitácora inmutable. Borrar una fila NO devuelve la
-//   fruta (el trigger es AFTER INSERT), así que deja el inventario
-//   descuadrado hasta que alguien lo corrija a mano. La vía recomendada es
-//   registrar el movimiento inverso, no borrar.
+//   DELETE /:id          ← EXCEPCIONAL. admin, con motivo obligatorio
+//       Borra la fila. Desde la v2.5 el trigger devuelve la fruta, así que
+//       es seguro para el inventario — pero borra también la evidencia de
+//       que hubo un error.
+//
+//       Se reserva para filas que NUNCA debieron existir: una captura
+//       duplicada, una prueba que se coló a producción.
+//
+//   POR QUÉ SE MANTIENE ESTA DISTINCIÓN
+//     Un inventario que cuadra no basta: hay que poder explicar CÓMO llegó
+//     a cuadrar. Es el mismo criterio de los pulpeos (una lectura errónea
+//     se cancela, no se borra) y de la auditoría de despachos.
+//
+// ---- POR QUÉ TRASLADAR ES SUPERVISOR ----
+//   Aquí se decide que la fruta YA TERMINÓ su ciclo de preenfrío. Sacarla
+//   antes de tiempo la manda caliente a conservación y compromete la
+//   calidad de todo el lote. Es criterio técnico, no ejecución.
 // ============================================================================
 
 // ---- Consultas ----
-// Las rutas con prefijo fijo van ANTES de "/:id": si no, Express
-// interpretaría "trasladables" como un id.
+// Las rutas con prefijo fijo van ANTES de "/:id".
 
 // Fruta dentro de cámaras de PREENFRÍO, candidata a pasar a conservación.
 // Es el origen del formulario. Viene ordenada por criticidad (v2.3) e
@@ -71,12 +79,15 @@ const router = Router();
 //   ?id_camara=1
 router.get("/trasladables", verifyToken, verifyOperativo, cargarAlcance, movimientosController.getTrasladables);
 
-// Cuánta fruta se movió por día y tipo. Reporte operativo.
+// Cuánta fruta se movió por día y tipo. Incluye el conteo de reversas: si
+// son muchas, algo está fallando en la captura.
 //   ?fecha_desde=2026-09-01   ?fecha_hasta=2026-09-30
 router.get("/resumen", verifyToken, verifyOperativo, cargarAlcance, movimientosController.getResumen);
 
-// Todos los movimientos de un lote, en orden cronológico.
-// Es la respuesta a "¿por dónde pasó esta fruta?" ante un reclamo.
+// Todos los movimientos de un lote, en orden cronológico, con las reversas
+// marcadas. Es la respuesta a "¿por dónde pasó esta fruta?" ante un
+// reclamo — y ahí es donde el movimiento inverso demuestra su valor frente
+// al borrado.
 router.get("/trazabilidad/:id_produccion", verifyToken, verifyOperativo, cargarAlcance, movimientosController.getTrazabilidad);
 
 // Bitácora general. Lee vw_movimientos, que ya resuelve nombres de cámaras,
@@ -85,6 +96,7 @@ router.get("/trazabilidad/:id_produccion", verifyToken, verifyOperativo, cargarA
 //   ?fecha_desde=...     ?fecha_hasta=...   ?buscar=texto
 router.get("/", verifyToken, verifyOperativo, cargarAlcance, movimientosController.getMovimientos);
 
+// Devuelve además si el movimiento ya fue revertido, y por cuál.
 router.get("/:id", verifyToken, verifyOperativo, cargarAlcance, validarIdMovimiento, movimientosController.getMovimientoById);
 
 // ---- Registrar traslado ----
@@ -106,12 +118,38 @@ router.post(
     movimientosController.createMovimiento
 );
 
-// ---- Eliminar de la bitácora ----
-// Solo admin. El controller bloquea los movimientos que pertenecen a un
-// despacho (tienen su propia reversa con fn_quitar_linea_despacho) y los
-// que generó una recepción.
+// ---- ⭐ Revertir · LA VÍA OFICIAL DE CORRECCIÓN ----
+// Crea el movimiento inverso: mismas cantidades, cámaras intercambiadas.
 //
-// La respuesta advierte que el borrado NO devolvió la fruta.
+// El motivo es obligatorio (mínimo 10 caracteres) y queda en las
+// observaciones junto con la referencia al original. Sin él, la reversa
+// sería tan opaca como un borrado.
+//
+// El controller bloquea:
+//   · revertir dos veces el mismo movimiento
+//   · revertir uno de recepción (tipo 1) o de despacho (tipo 3): esos
+//     tienen su propia reversa en sus módulos
+//   · revertir cuando la fruta ya se movió del destino
+router.post(
+    "/:id/revertir",
+    verifyToken,
+    verifySupervisor,
+    cargarAlcance,
+    validarIdMovimiento,
+    validarReversa,
+    movimientosController.revertirMovimiento
+);
+
+// ---- Eliminar · VÍA EXCEPCIONAL ----
+// Solo admin, y con motivo obligatorio aunque la fila vaya a desaparecer:
+// queda en el log del servidor, que es el único rastro que quedará.
+//
+// El controller bloquea los movimientos que pertenecen a un despacho
+// (tienen su propia reversa con fn_quitar_linea_despacho) y los que generó
+// una recepción.
+//
+// La respuesta advierte que la fila se eliminó de la bitácora y sugiere
+// usar /revertir para correcciones auditables.
 router.delete("/:id", verifyToken, verifyAdmin, cargarAlcance, validarIdMovimiento, movimientosController.deleteMovimiento);
 
 export default router;

@@ -155,8 +155,7 @@ export const validarMovimiento = (req, res, next) => {
 
     // ---- Temperatura ----
     // Es el dato que justifica el traslado: la fruta pasa a conservación
-    // cuando ya alcanzó su temperatura objetivo. Mismo rango que en
-    // recepciones.
+    // cuando ya alcanzó su temperatura objetivo.
     let tempNum = null;
 
     if (temperatura !== undefined && temperatura !== null && temperatura !== "") {
@@ -194,6 +193,106 @@ export const validarMovimiento = (req, res, next) => {
     // El despacho no aplica a los traslados: se fuerza a null para que un
     // body malicioso no lo cuele.
     req.body.id_despacho = null;
+
+    next();
+};
+
+// ----------------------------------------------------------------------------
+// ⭐ v2.5 · Validación de la reversa
+// ----------------------------------------------------------------------------
+// El motivo es OBLIGATORIO. Sin él, la reversa es tan opaca como un
+// borrado: se vería que la fruta volvió, pero no por qué.
+//
+// Ese texto queda en las observaciones del movimiento inverso, junto con la
+// referencia al original. Es lo único que va a leer quien audite esto
+// dentro de seis meses.
+export const validarReversa = (req, res, next) => {
+    const { motivo, fecha, hora, temperatura } = req.body;
+
+    // ---- Motivo ----
+    if (!motivo || typeof motivo !== "string" || motivo.trim() === "") {
+        return res.status(400).json({
+            error: 'El campo "motivo" es obligatorio: explica por qué se revierte el traslado'
+        });
+    }
+
+    // Mismo umbral que la auditoría de despachos: "error" no explica nada.
+    if (motivo.trim().length < 10) {
+        return res.status(400).json({
+            error: 'El campo "motivo" debe explicar la corrección: usa al menos 10 caracteres'
+        });
+    }
+
+    // Las observaciones son VARCHAR(250) y el prefijo
+    // "Reversa del movimiento #NNN · " ocupa unos 30 caracteres.
+    if (motivo.length > 200) {
+        return res.status(400).json({
+            error: 'El campo "motivo" no puede exceder 200 caracteres'
+        });
+    }
+
+    // ---- Fecha y hora ----
+    // Opcionales: por defecto el momento actual. Se permiten para
+    // registrar una corrección que se hizo físicamente hace rato.
+    let fechaNorm = null;
+
+    if (fecha) {
+        const f = new Date(fecha);
+
+        if (isNaN(f.getTime())) {
+            return res.status(400).json({
+                error: 'El campo "fecha" no es una fecha válida (usa AAAA-MM-DD)'
+            });
+        }
+
+        const finDeHoy = new Date();
+        finDeHoy.setHours(23, 59, 59, 999);
+
+        if (f > finDeHoy) {
+            return res.status(400).json({
+                error: "La fecha de la reversa no puede ser futura"
+            });
+        }
+
+        fechaNorm = fecha;
+    }
+
+    let horaNorm = null;
+
+    if (hora) {
+        if (!/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(String(hora))) {
+            return res.status(400).json({
+                error: 'El campo "hora" debe tener formato HH:MM o HH:MM:SS'
+            });
+        }
+        horaNorm = hora;
+    }
+
+    // ---- Temperatura ----
+    // Opcional: la fruta regresa al preenfrío y conviene registrar a qué
+    // temperatura volvió.
+    let tempNum = null;
+
+    if (temperatura !== undefined && temperatura !== null && temperatura !== "") {
+        tempNum = Number(temperatura);
+
+        if (isNaN(tempNum)) {
+            return res.status(400).json({
+                error: 'El campo "temperatura" debe ser numérico'
+            });
+        }
+
+        if (tempNum < -5 || tempNum > 45) {
+            return res.status(400).json({
+                error: 'El campo "temperatura" está fuera de rango (-5 a 45 °C)'
+            });
+        }
+    }
+
+    req.body.motivo = motivo.trim();
+    req.body.fecha = fechaNorm;
+    req.body.hora = horaNorm;
+    req.body.temperatura = tempNum;
 
     next();
 };
