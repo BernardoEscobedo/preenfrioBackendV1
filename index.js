@@ -30,6 +30,9 @@ import recepcionesRouter from "./routes/recepciones.route.js";
 import ocupacionesRouter from "./routes/ocupaciones.route.js";
 import movimientosRouter from "./routes/movimientos.route.js";
 import despachosRouter from "./routes/despachos.route.js";
+import bloquesRouter from "./routes/bloques.route.js";
+import pulpeosRouter from "./routes/pulpeos.route.js";
+
 
 dotenv.config();
 
@@ -105,6 +108,8 @@ app.use(`${API}/recepciones`, recepcionesRouter);
 app.use(`${API}/ocupaciones`, ocupacionesRouter);
 app.use(`${API}/movimientos`, movimientosRouter);
 app.use(`${API}/despachos`, despachosRouter);
+app.use(`${API}/bloques`, bloquesRouter);
+app.use(`${API}/pulpeos`, pulpeosRouter);
 
 
 // Salud del servicio: sirve para verificar que responde sin tocar la BD.
