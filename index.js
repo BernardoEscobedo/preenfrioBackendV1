@@ -32,7 +32,7 @@ import movimientosRouter from "./routes/movimientos.route.js";
 import despachosRouter from "./routes/despachos.route.js";
 import bloquesRouter from "./routes/bloques.route.js";
 import pulpeosRouter from "./routes/pulpeos.route.js";
-
+import mantenimientosRouter from "./routes/mantenimientos.route.js";
 
 dotenv.config();
 
@@ -110,7 +110,7 @@ app.use(`${API}/movimientos`, movimientosRouter);
 app.use(`${API}/despachos`, despachosRouter);
 app.use(`${API}/bloques`, bloquesRouter);
 app.use(`${API}/pulpeos`, pulpeosRouter);
-
+app.use(`${API}/mantenimientos`, mantenimientosRouter);
 
 // Salud del servicio: sirve para verificar que responde sin tocar la BD.
 app.get(`${API}/health`, (req, res) => {
