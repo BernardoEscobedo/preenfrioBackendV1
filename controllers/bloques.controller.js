@@ -15,8 +15,26 @@ import produccionModel from "../models/produccion.model.js";
 //   bloques_fruta no tiene id_camara: el bloque se define por la fruta que
 //   agrupa. Un bloque armado pertenece a las cámaras de sus procesos; uno
 //   vacío todavía no tiene planta, así que cualquiera puede continuarlo.
-//   Mismo criterio que en despachos.
+//
+// CORRECCIONES DE LA AUDITORÍA
+//   · Las cámaras son las REALES (donde se recibió o se trasladó la fruta),
+//     no la planeada. Si el camión se desvió en el andén, el supervisor de
+//     la cámara donde está la fruta es quien puede armar y pulpear el
+//     bloque. Lo resuelve bloques.model con SQL_CAMARAS_REALES.
+//
+//   · No se puede agregar a un bloque una producción que no ha llegado
+//     (estado 1, planeada). Un bloque es un montón físico: fruta que sigue
+//     en la finca no puede estar apilada en la cámara.
 // ============================================================================
+
+/**
+ * ¿El usuario tiene acceso a alguna de estas cámaras?
+ * null en req.camaras = alcance total (admin y coordinador).
+ */
+const tocaAlguna = (camarasFruta, camarasUsuario) => {
+    if (!Array.isArray(camarasUsuario)) return true;
+    return camarasFruta.some((c) => camarasUsuario.includes(Number(c)));
+};
 
 /**
  * Valida acceso a un bloque ya armado.
@@ -30,9 +48,7 @@ const validarAlcanceBloque = async (id_bloque, camaras) => {
     // Bloque vacío: sin fruta todavía, no hay planta que proteger
     if (camarasDelBloque.length === 0) return null;
 
-    const tieneAcceso = camarasDelBloque.some((c) => camaras.includes(c));
-
-    if (!tieneAcceso) {
+    if (!tocaAlguna(camarasDelBloque, camaras)) {
         return {
             status: 403,
             error: "No tienes acceso a ese bloque: su fruta está en otras cámaras"
@@ -213,7 +229,7 @@ const agregarLinea = async (req, res) => {
             });
         }
 
-        // ---- La producción existe y tiene fruta ----
+        // ---- La producción existe y ya llegó ----
         const produccion = await produccionModel.getProduccionById(id_produccion);
 
         if (!produccion) {
@@ -228,13 +244,19 @@ const agregarLinea = async (req, res) => {
             });
         }
 
-        // ---- Alcance sobre la cámara de la producción ----
-        // No viene en el body: se deduce de la producción.
-        if (
-            Array.isArray(req.camaras) &&
-            produccion.id_camara !== null &&
-            !req.camaras.includes(Number(produccion.id_camara))
-        ) {
+        // Un bloque es un montón físico: fruta que no ha llegado no puede
+        // estar apilada en la cámara.
+        if (produccion.estado === 1) {
+            return res.status(409).json({
+                error: `La producción ${produccion.codigo_lote} todavía no tiene recepciones: no se puede armar en un bloque fruta que no ha llegado.`
+            });
+        }
+
+        // ---- Alcance sobre las cámaras REALES de la producción ----
+        // Donde se recibió o a donde se trasladó, no la planeada.
+        const camarasFruta = await bloquesModel.getCamarasDeProduccion(id_produccion);
+
+        if (camarasFruta.length > 0 && !tocaAlguna(camarasFruta, req.camaras)) {
             return res.status(403).json({
                 error: "No tienes acceso a la cámara donde está esa fruta"
             });
@@ -304,46 +326,54 @@ const agregarLinea = async (req, res) => {
     }
 };
 
+// Validaciones comunes para editar o quitar una línea.
+// Devuelve { linea } si todo cuadra, o { status, error } para responder.
+const validarLineaEditable = async (id, id_detalle, camaras) => {
+    const bloque = await bloquesModel.getBloqueById(id);
+
+    if (!bloque) {
+        return { status: 404, error: "Bloque no encontrado" };
+    }
+
+    const linea = await bloquesModel.getLineaById(id_detalle);
+
+    if (!linea) {
+        return { status: 404, error: "Línea no encontrada" };
+    }
+
+    if (Number(linea.id_bloque) !== Number(id)) {
+        return { status: 409, error: "Esa línea no pertenece a este bloque" };
+    }
+
+    const despachos = await bloquesModel.getLineasDespachoLigadas(id);
+
+    if (despachos.length > 0) {
+        return {
+            status: 409,
+            error: `El bloque ya forma parte del despacho ${despachos[0].folio_despacho}: su composición no puede cambiar.`
+        };
+    }
+
+    // Alcance sobre las cámaras reales de esa producción
+    const camarasFruta = (linea.camaras ?? []).map(Number);
+
+    if (camarasFruta.length > 0 && !tocaAlguna(camarasFruta, camaras)) {
+        return { status: 403, error: "No tienes acceso a la cámara donde está esa fruta" };
+    }
+
+    return { linea };
+};
+
 // PUT /api/preenfrio/bloques/:id/lineas/:id_detalle
 const actualizarLinea = async (req, res) => {
     try {
         const { id, id_detalle } = req.params;
         const { cantidad_tarimas, cantidad_cajas } = req.body;
 
-        const bloque = await bloquesModel.getBloqueById(id);
+        const validacion = await validarLineaEditable(id, id_detalle, req.camaras);
 
-        if (!bloque) {
-            return res.status(404).json({ error: "Bloque no encontrado" });
-        }
-
-        const linea = await bloquesModel.getLineaById(id_detalle);
-
-        if (!linea) {
-            return res.status(404).json({ error: "Línea no encontrada" });
-        }
-
-        if (Number(linea.id_bloque) !== Number(id)) {
-            return res.status(409).json({
-                error: "Esa línea no pertenece a este bloque"
-            });
-        }
-
-        const despachos = await bloquesModel.getLineasDespachoLigadas(id);
-
-        if (despachos.length > 0) {
-            return res.status(409).json({
-                error: `El bloque ya forma parte del despacho ${despachos[0].folio_despacho}: su composición no puede cambiar.`
-            });
-        }
-
-        if (
-            Array.isArray(req.camaras) &&
-            linea.id_camara !== null &&
-            !req.camaras.includes(Number(linea.id_camara))
-        ) {
-            return res.status(403).json({
-                error: "No tienes acceso a la cámara donde está esa fruta"
-            });
+        if (validacion.error) {
+            return res.status(validacion.status).json({ error: validacion.error });
         }
 
         await bloquesModel.actualizarLinea(id_detalle, {
@@ -372,47 +402,17 @@ const quitarLinea = async (req, res) => {
     try {
         const { id, id_detalle } = req.params;
 
-        const bloque = await bloquesModel.getBloqueById(id);
+        const validacion = await validarLineaEditable(id, id_detalle, req.camaras);
 
-        if (!bloque) {
-            return res.status(404).json({ error: "Bloque no encontrado" });
-        }
-
-        const linea = await bloquesModel.getLineaById(id_detalle);
-
-        if (!linea) {
-            return res.status(404).json({ error: "Línea no encontrada" });
-        }
-
-        if (Number(linea.id_bloque) !== Number(id)) {
-            return res.status(409).json({
-                error: "Esa línea no pertenece a este bloque"
-            });
-        }
-
-        const despachos = await bloquesModel.getLineasDespachoLigadas(id);
-
-        if (despachos.length > 0) {
-            return res.status(409).json({
-                error: `El bloque ya forma parte del despacho ${despachos[0].folio_despacho}: su composición no puede cambiar.`
-            });
-        }
-
-        if (
-            Array.isArray(req.camaras) &&
-            linea.id_camara !== null &&
-            !req.camaras.includes(Number(linea.id_camara))
-        ) {
-            return res.status(403).json({
-                error: "No tienes acceso a la cámara donde está esa fruta"
-            });
+        if (validacion.error) {
+            return res.status(validacion.status).json({ error: validacion.error });
         }
 
         await bloquesModel.quitarLinea(id_detalle);
         const completo = await bloquesModel.getBloqueById(id);
 
         res.status(200).json({
-            mensaje: `Lote ${linea.codigo_lote} retirado del bloque`,
+            mensaje: `Lote ${validacion.linea.codigo_lote} retirado del bloque`,
             totales: {
                 tarimas: completo.cantidad_tarimas,
                 cajas: completo.cantidad_cajas,
@@ -472,6 +472,11 @@ const rearmarBloque = async (req, res) => {
 
         if (!bloque) {
             return res.status(404).json({ error: "Bloque no encontrado" });
+        }
+
+        const problema = await validarAlcanceBloque(id, req.camaras);
+        if (problema) {
+            return res.status(problema.status).json({ error: problema.error });
         }
 
         if (Number(bloque.estado) !== 0) {

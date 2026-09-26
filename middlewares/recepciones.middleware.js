@@ -1,3 +1,5 @@
+import { aFechaISO, esFechaFutura } from "../utils/fechas.js";
+
 // ============================================================================
 // VALIDACIONES DE RECEPCIONES
 // ============================================================================
@@ -10,7 +12,17 @@
 //   mal capturado no genera un error visible: genera una ocupación de
 //   cámara equivocada que nadie nota hasta que el conteo físico no cuadra,
 //   semanas después. Es más barato rechazar aquí.
+//
+// CORRECCIONES DE LA AUDITORÍA
+//   · "Fecha futura" se evalúa en la zona de operación y comparando texto.
+//     Antes new Date("AAAA-MM-DD") se tomaba como medianoche UTC y, en
+//     Tapachula, la fecha de MAÑANA pasaba la validación.
+//   · Cajas y tarimas exigen enteros: con 2.5 Postgres rechazaba el valor en
+//     la columna INT y se respondía 500 en vez de 400.
 // ============================================================================
+
+/** true si el valor es un entero >= 0 */
+const esEnteroNoNegativo = (n) => Number.isInteger(n) && n >= 0;
 
 export const validarRecepcion = (req, res, next) => {
     const {
@@ -54,20 +66,16 @@ export const validarRecepcion = (req, res, next) => {
         });
     }
 
-    const fecha = new Date(fecha_recepcion);
+    const fecha = aFechaISO(fecha_recepcion);
 
-    if (isNaN(fecha.getTime())) {
+    if (!fecha) {
         return res.status(400).json({
             error: 'El campo "fecha_recepcion" no es una fecha válida (usa AAAA-MM-DD)'
         });
     }
 
-    // Recibir "mañana" es siempre un error de captura. Se compara contra el
-    // final del día de hoy para no pelear con zonas horarias.
-    const finDeHoy = new Date();
-    finDeHoy.setHours(23, 59, 59, 999);
-
-    if (fecha > finDeHoy) {
+    // Recibir "mañana" es siempre un error de captura.
+    if (esFechaFutura(fecha)) {
         return res.status(400).json({
             error: "La fecha de recepción no puede ser futura"
         });
@@ -91,9 +99,9 @@ export const validarRecepcion = (req, res, next) => {
         ? 0
         : Number(cajas_recibidas);
 
-    if (isNaN(cajas) || cajas < 0) {
+    if (!esEnteroNoNegativo(cajas)) {
         return res.status(400).json({
-            error: 'El campo "cajas_recibidas" debe ser un número mayor o igual a 0'
+            error: 'El campo "cajas_recibidas" debe ser un número entero mayor o igual a 0'
         });
     }
 
@@ -101,9 +109,9 @@ export const validarRecepcion = (req, res, next) => {
         ? 0
         : Number(tarimas_recibidas);
 
-    if (isNaN(tarimas) || tarimas < 0) {
+    if (!esEnteroNoNegativo(tarimas)) {
         return res.status(400).json({
-            error: 'El campo "tarimas_recibidas" debe ser un número mayor o igual a 0'
+            error: 'El campo "tarimas_recibidas" debe ser un número entero mayor o igual a 0'
         });
     }
 
@@ -144,9 +152,9 @@ export const validarRecepcion = (req, res, next) => {
     ) {
         ingresadasNum = Number(tarimas_ingresadas);
 
-        if (isNaN(ingresadasNum) || ingresadasNum < 0) {
+        if (!esEnteroNoNegativo(ingresadasNum)) {
             return res.status(400).json({
-                error: 'El campo "tarimas_ingresadas" debe ser un número mayor o igual a 0'
+                error: 'El campo "tarimas_ingresadas" debe ser un número entero mayor o igual a 0'
             });
         }
 
@@ -159,6 +167,10 @@ export const validarRecepcion = (req, res, next) => {
     }
 
     // ---- Cajas ingresadas ----
+    // Nota: desde la v2.5 el trigger reparte las cajas en proporción a las
+    // tarimas que entran y escribe el resultado de vuelta, así que este
+    // valor se valida pero no manda. Se conserva para no romper el contrato
+    // con el frontend.
     let cajasIngNum = null;
 
     if (
@@ -168,9 +180,9 @@ export const validarRecepcion = (req, res, next) => {
     ) {
         cajasIngNum = Number(cajas_ingresadas);
 
-        if (isNaN(cajasIngNum) || cajasIngNum < 0) {
+        if (!esEnteroNoNegativo(cajasIngNum)) {
             return res.status(400).json({
-                error: 'El campo "cajas_ingresadas" debe ser un número mayor o igual a 0'
+                error: 'El campo "cajas_ingresadas" debe ser un número entero mayor o igual a 0'
             });
         }
 
@@ -213,6 +225,7 @@ export const validarRecepcion = (req, res, next) => {
     // ---- Normalización ----
     req.body.id_produccion = Number(id_produccion);
     req.body.id_camara = camaraNum;
+    req.body.fecha_recepcion = fecha;
     req.body.cajas_recibidas = cajas;
     req.body.tarimas_recibidas = tarimas;
     req.body.tarimas_ingresadas = ingresadasNum;
@@ -226,9 +239,10 @@ export const validarRecepcion = (req, res, next) => {
 // ----------------------------------------------------------------------------
 // Validación de la edición
 // ----------------------------------------------------------------------------
-// Solo temperatura y observaciones: las cantidades NO se editan porque
-// trg_sync_ocupacion_recepcion es AFTER INSERT y no revertiría la ocupación
-// ya generada. Si el número estuvo mal, se cancela y se captura de nuevo.
+// Solo temperatura y observaciones. Las cantidades NO se editan: el trigger
+// de reversa (v2.5) reacciona al cambio de ESTADO, no a un cambio de
+// cantidades. Un UPDATE de tarimas movería el número en la tabla sin tocar
+// la ocupación. Si el número estuvo mal, se cancela y se captura de nuevo.
 export const validarEdicionRecepcion = (req, res, next) => {
     const { temperatura, observaciones } = req.body;
 

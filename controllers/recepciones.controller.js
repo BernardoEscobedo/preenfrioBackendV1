@@ -13,23 +13,34 @@ import camarasModel from "../models/camaras.model.js";
 //   El INSERT dispara los triggers que reparten la fruta entre la cámara y
 //   la cola. Aquí solo se valida ANTES y se informa DESPUÉS.
 //
-// ────────────────────────────────────────────────────────────────────────
-// v2.5 · CANCELAR AHORA SÍ LIBERA LA CÁMARA
-// ────────────────────────────────────────────────────────────────────────
-//   Hasta la v2.4, trg_sync_ocupacion_recepcion era AFTER INSERT: cancelar
-//   una recepción cambiaba su estado pero dejaba la fruta contada dentro.
-//   Este controller advertía de eso en la respuesta.
+// v2.5 · CANCELAR SÍ LIBERA LA CÁMARA
+//   trg_revertir_recepcion (AFTER UPDATE) descuenta lo que esa recepción
+//   metió y cierra su fila de cola. Lo que sí hay que seguir avisando: si
+//   parte de esa fruta ya se movió o se despachó, la cámara solo descuenta
+//   lo que todavía tiene (el trigger corta con GREATEST para no quedar en
+//   negativo).
 //
-//   La v2.5 agregó trg_revertir_recepcion (AFTER UPDATE), que descuenta lo
-//   que esa recepción metió y cierra su fila de cola. Los mensajes se
-//   actualizaron: antes decían "la cancelación NO libera la cámara", que
-//   ahora es falso.
+// CORRECCIONES DE LA AUDITORÍA
+//   · El aviso de sobre-recepción nunca aparecía. Se leía
+//     produccion.tarimas_planeadas, un alias que no existe en el SELECT de
+//     producción: llegaba undefined, se volvía 0 y la condición nunca se
+//     cumplía. La columna real es estiba_pallets.
 //
-//   Queda un caso que SÍ hay que seguir avisando: si parte de esa fruta ya
-//   se movió a conservación o ya se despachó, la cámara solo puede
-//   descontar lo que todavía tiene. El trigger corta con GREATEST(x, 0)
-//   para no dejar el inventario en negativo, y aquí se detecta comparando
-//   antes y después.
+//   · Al cancelar, las "tarimas liberadas" se calculaban restando
+//     tarimas_disponibles de antes y de después. Esa cifra sale de
+//     fn_tarimas_disponibles, que nunca baja de 0 y vale 0 en
+//     mantenimiento: con la cámara parada salía un falso "solo se liberaron
+//     0", y con la cámara sobreocupada salía un número menor al real.
+//     Ahora se usa la diferencia de tarimas_ocupadas, que es el dato real.
+//
+//   · Al reactivar, el aviso de sobreocupación revisaba
+//     tarimas_disponibles < 0, que por lo mismo nunca pasa. Ahora compara
+//     ocupadas contra la capacidad.
+//
+//   · Al registrar, desde la segunda recepción de una cámara el mensaje
+//     decía "Entraron 0 tarimas": se leía la ocupación tipo 1, que es
+//     compartida y solo lleva el id de la PRIMERA recepción. Ahora se usa
+//     tarimas_ingresadas (o se deduce de la cola si falta la v2.5).
 // ============================================================================
 
 // GET /api/preenfrio/recepciones?id_produccion=5&estado=1
@@ -162,12 +173,7 @@ const getDisponibilidad = async (req, res) => {
 // El INSERT dispara dos triggers. Aquí se valida antes y se informa después.
 const createRecepcion = async (req, res) => {
     try {
-        const {
-            id_produccion,
-            id_camara,
-            tarimas_recibidas,
-            cajas_recibidas
-        } = req.body;
+        const { id_produccion, id_camara, tarimas_recibidas } = req.body;
 
         // ---- La producción existe y se puede recibir ----
         const produccion = await produccionModel.getProduccionById(id_produccion);
@@ -204,7 +210,6 @@ const createRecepcion = async (req, res) => {
         // Se permite registrar la recepción (queda el dato de que llegó),
         // pero no generará ocupación alguna.
         let avisoCamara = null;
-        let disponibilidad = null;
 
         if (camaraDestino !== null) {
             const camara = await camarasModel.getCamaraById(camaraDestino);
@@ -219,7 +224,7 @@ const createRecepcion = async (req, res) => {
                 });
             }
 
-            disponibilidad = await recepcionesModel.getDisponibilidad(camaraDestino);
+            const disponibilidad = await recepcionesModel.getDisponibilidad(camaraDestino);
 
             // Mantenimiento activo: fn_tarimas_disponibles devuelve 0, así
             // que TODO se iría a la cola. Se bloquea porque casi siempre es
@@ -244,8 +249,11 @@ const createRecepcion = async (req, res) => {
         // No se bloquea: en campo a veces llega más de lo planeado y hay
         // que registrarlo. Pero se avisa, porque suele ser error de captura
         // o fruta de otro proceso mezclada.
+        //
+        // Las tarimas planeadas viven en produccion.estiba_pallets. Antes se
+        // leía un alias inexistente y el aviso nunca aparecía.
         const yaRecibidas = Number(produccion.tarimas_recibidas) || 0;
-        const planeadas = Number(produccion.tarimas_planeadas) || 0;
+        const planeadas = Number(produccion.estiba_pallets) || 0;
         const totalTrasEsta = yaRecibidas + Number(tarimas_recibidas);
 
         let avisoExceso = null;
@@ -269,19 +277,32 @@ const createRecepcion = async (req, res) => {
             nueva.id_recepcion
         );
 
-        const dentro = ocupaciones.find((o) => o.tipo_ocupacion === 1);
         const enCola = ocupaciones.find((o) => o.tipo_ocupacion === 3);
+        const tarimasEnCola = Number(enCola?.cantidad_tarimas ?? 0);
 
-        // Resumen legible de lo que pasó realmente, leído de la BD y no
-        // recalculado aquí.
+        // Cuánto entró a la cámara.
+        //
+        // Antes se leía de la ocupación tipo 1, pero esa fila es COMPARTIDA:
+        // la crea la primera recepción de la cámara y las siguientes solo le
+        // suman. Como getOcupacionesGeneradas filtra por id_recepcion, a
+        // partir de la segunda recepción no la encontraba y el mensaje
+        // decía "Entraron 0 tarimas".
+        //
+        // Desde la v2.5 el trigger escribe de vuelta tarimas_ingresadas, que
+        // es el dato exacto. Si la migración todavía no se corrió, se deduce:
+        // lo que no quedó en la cola de ESTA recepción, entró.
+        const entraron =
+            completa.tarimas_ingresadas ??
+            Math.max(Number(completa.tarimas_recibidas) - tarimasEnCola, 0);
+
         let resultado;
 
         if (camaraDestino === null) {
             resultado = "Recepción registrada. Esta producción no pasa por preenfrío (CEDA directo): no ocupa cámara.";
-        } else if (enCola) {
-            resultado = `Entraron ${dentro?.cantidad_tarimas ?? 0} tarimas a "${completa.nombre_camara}" y ${enCola.cantidad_tarimas} quedaron EN COLA esperando espacio.`;
+        } else if (tarimasEnCola > 0) {
+            resultado = `Entraron ${entraron} tarimas a "${completa.nombre_camara}" y ${tarimasEnCola} quedaron EN COLA esperando espacio.`;
         } else {
-            resultado = `Entraron ${dentro?.cantidad_tarimas ?? 0} tarimas completas a "${completa.nombre_camara}".`;
+            resultado = `Entraron ${entraron} tarimas completas a "${completa.nombre_camara}".`;
         }
 
         res.status(201).json({
@@ -312,13 +333,12 @@ const createRecepcion = async (req, res) => {
 // ----------------------------------------------------------------------------
 // Solo temperatura y observaciones.
 //
-// Las cantidades NO se editan, y esto sigue vigente en la v2.5: el trigger
-// nuevo reacciona al cambio de ESTADO, no a un cambio de cantidades. Un
-// UPDATE de tarimas_recibidas movería el número en la tabla sin tocar la
-// ocupación.
+// Las cantidades NO se editan: el trigger de reversa (v2.5) reacciona al
+// cambio de ESTADO, no a un cambio de cantidades. Un UPDATE de
+// tarimas_recibidas movería el número en la tabla sin tocar la ocupación.
 //
-// Para corregir un número hay que cancelar y volver a capturar — y ahora
-// eso sí devuelve la capacidad.
+// Para corregir un número hay que cancelar y volver a capturar — y eso sí
+// devuelve la capacidad.
 const updateRecepcion = async (req, res) => {
     try {
         const { id } = req.params;
@@ -366,16 +386,13 @@ const updateRecepcion = async (req, res) => {
 //   trg_actualizar_estado_produccion  recalcula el estado de la producción
 //                                     (solo suma las recepciones activas)
 //
-//   trg_revertir_recepcion  ⭐ v2.5   descuenta de la cámara lo que esta
+//   trg_revertir_recepcion  (v2.5)    descuenta de la cámara lo que esta
 //                                     recepción metió y cierra su fila de
 //                                     cola
 //
-// El segundo es nuevo. Antes la cámara se quedaba con la fruta contada y
-// este controller lo advertía; ahora se libera sola.
-//
-// Lo que SÍ hay que seguir avisando: si parte de esa fruta ya se movió o se
-// despachó, la cámara solo descuenta lo que todavía tiene. Se detecta
-// comparando el inventario antes y después.
+// Lo que se compara para saber cuánto se liberó es tarimas_ocupadas, no
+// tarimas_disponibles: la segunda nunca baja de 0 y vale 0 en
+// mantenimiento, así que daba cifras falsas.
 const cancelarRecepcion = async (req, res) => {
     try {
         const { id } = req.params;
@@ -418,8 +435,7 @@ const cancelarRecepcion = async (req, res) => {
         const esperaba = Number(existente.tarimas_ingresadas ?? 0);
         const liberadas =
             antes && despues
-                ? Number(despues.tarimas_disponibles) -
-                  Number(antes.tarimas_disponibles)
+                ? Number(antes.tarimas_ocupadas) - Number(despues.tarimas_ocupadas)
                 : 0;
 
         const avisos = [];
@@ -439,9 +455,9 @@ const cancelarRecepcion = async (req, res) => {
         } else if (liberadas > 0) {
             resultado = `Se liberaron ${liberadas} tarima(s) en "${existente.nombre_camara}".`;
         } else if (esperaba === 0) {
-            resultado = `Recepción cancelada. No había fruta dentro de la cámara que liberar.`;
+            resultado = "Recepción cancelada. No había fruta dentro de la cámara que liberar.";
         } else {
-            resultado = `Recepción cancelada, pero la cámara no cambió: esa fruta ya no estaba ahí.`;
+            resultado = "Recepción cancelada, pero la cámara no cambió: esa fruta ya no estaba ahí.";
         }
 
         res.status(200).json({
@@ -451,9 +467,10 @@ const cancelarRecepcion = async (req, res) => {
             capacidad: despues
                 ? {
                       camara: existente.nombre_camara,
-                      antes: Number(antes.tarimas_disponibles),
-                      despues: Number(despues.tarimas_disponibles),
-                      liberadas
+                      ocupadas_antes: Number(antes.tarimas_ocupadas),
+                      ocupadas_despues: Number(despues.tarimas_ocupadas),
+                      liberadas,
+                      disponibles: Number(despues.tarimas_disponibles)
                   }
                 : null,
             avisos
@@ -522,8 +539,13 @@ const reactivarRecepcion = async (req, res) => {
             );
         }
 
-        // La cámara quedó sobreocupada
-        if (despues && Number(despues.tarimas_disponibles) < 0) {
+        // La cámara quedó sobreocupada.
+        // Se compara ocupadas contra capacidad: tarimas_disponibles nunca
+        // baja de 0, así que con la versión anterior este aviso no salía.
+        if (
+            despues &&
+            Number(despues.tarimas_ocupadas) > Number(despues.capacidad_max_tarimas)
+        ) {
             avisos.push(
                 `⚠️ "${existente.nombre_camara}" quedó sobreocupada: ${despues.tarimas_ocupadas} tarimas contra una capacidad de ${despues.capacidad_max_tarimas}. Mueve fruta a conservación o despáchala.`
             );
@@ -538,8 +560,9 @@ const reactivarRecepcion = async (req, res) => {
             capacidad: despues
                 ? {
                       camara: existente.nombre_camara,
-                      antes: Number(antes.tarimas_disponibles),
-                      despues: Number(despues.tarimas_disponibles)
+                      ocupadas_antes: Number(antes.tarimas_ocupadas),
+                      ocupadas_despues: Number(despues.tarimas_ocupadas),
+                      capacidad: Number(despues.capacidad_max_tarimas)
                   }
                 : null,
             avisos

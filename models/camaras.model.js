@@ -16,18 +16,30 @@ import { db } from "../database/connection.database.js";
 //   dropdowns del sistema se acotan solos. Un supervisor de Doña Nelly ya
 //   no podrá siquiera elegir Fortaleza al mover inventario, porque su lista
 //   no la trae. Previene errores de captura, no solo fugas de información.
+//
+// CORRECCIÓN DE LA AUDITORÍA
+//   Desde la v2.2 la tabla tiene 'estado' (1 operativa · 0 fuera de
+//   servicio), pero getCamarasByTipo —que alimenta dropdowns como el
+//   destino al mover a conserva— seguía ofreciendo cámaras dadas de baja.
+//   Ahora filtra estado = 1.
+//
+//   getCamaras NO filtra por estado a propósito: es también la pantalla del
+//   catálogo, y el admin tiene que poder ver las cámaras fuera de servicio
+//   (sobre todo si les quedó inventario dentro). Para supervisores ya viene
+//   filtrado: fn_camaras_usuario excluye las cámaras dadas de baja.
 // ============================================================================
 
 // Lista filtrada por alcance.
 // El patrón ($1::INT[] IS NULL OR ...) sirve para los dos casos con la
 // misma query: si el parámetro llega NULL la condición se cumple siempre.
+// Las fuera de servicio salen al final.
 const getCamaras = async (camaras = null) => {
     const result = await db.query(
         `
         SELECT *
         FROM camaras
         WHERE ($1::INT[] IS NULL OR id_camara = ANY($1))
-        ORDER BY tipo_camara, nombre_camara
+        ORDER BY estado DESC, tipo_camara, nombre_camara
         `,
         [camaras]
     );
@@ -45,15 +57,17 @@ const getCamaraById = async (id_camara) => {
     return result.rows[0];
 };
 
-// Cámaras por tipo: 1=preenfrío · 2=conservación.
+// Cámaras OPERATIVAS por tipo: 1=preenfrío · 2=conservación.
 // Útil para los dropdowns que solo aceptan uno de los dos (ej. el destino
-// al mover a conserva).
+// al mover a conserva). Una cámara fuera de servicio no debe ofrecerse como
+// destino: el controller la rechazaría después con un 409.
 const getCamarasByTipo = async (tipo_camara, camaras = null) => {
     const result = await db.query(
         `
         SELECT *
         FROM camaras
         WHERE tipo_camara = $1
+          AND estado = 1
           AND ($2::INT[] IS NULL OR id_camara = ANY($2))
         ORDER BY nombre_camara
         `,

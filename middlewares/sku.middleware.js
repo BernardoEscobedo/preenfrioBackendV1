@@ -12,6 +12,16 @@
 // Código y calidad se guardan en mayúsculas: el catálogo se captura desde
 // varios lados (pantalla, importación del Excel) y sin normalizar acabarían
 // conviviendo "PRIMERA", "Primera" y "primera" como calidades distintas.
+//
+// CORRECCIÓN DE LA AUDITORÍA · EL CÓDIGO SE LIMPIA DE ESPACIOS
+//   Productores, fincas, cedis y bloques ya quitaban los espacios; el SKU
+//   no. Un "CPL 0813A" dejaba de coincidir con LIKE 'CPL0813%' y el cálculo
+//   de cajas por tarima daba 48 en lugar de 42: todas las tarimas de esa
+//   familia quedaban mal estimadas.
+//
+//   En el PUT, 'turno' y 'estado' ya llegan con su valor actual gracias a
+//   conservarCampos (ver sku.route.js): el default de 1 solo aplica de
+//   verdad en el alta.
 // ============================================================================
 
 const TURNOS_VALIDOS = [1, 2];
@@ -26,11 +36,18 @@ export const validarSku = (req, res, next) => {
         });
     }
 
-    const codigo = codigo_sku.trim().toUpperCase();
+    // Sin espacios internos: "CPL 0813A" y "CPL0813A" son el mismo empaque.
+    const codigo = codigo_sku.trim().toUpperCase().replace(/\s+/g, "");
 
     if (codigo.length > 10) {
         return res.status(400).json({
             error: 'El campo "codigo_sku" no puede exceder 10 caracteres'
+        });
+    }
+
+    if (!/^[A-Z0-9_-]+$/.test(codigo)) {
+        return res.status(400).json({
+            error: 'El campo "codigo_sku" solo admite letras, números, guion y guion bajo'
         });
     }
 
@@ -58,7 +75,7 @@ export const validarSku = (req, res, next) => {
     }
 
     // ---- Estado ----
-    // Nuevo en v2.2. Opcional en el alta: si no viene, el SKU nace activo.
+    // Opcional en el alta: si no viene, el SKU nace activo.
     const estadoNum = estado === undefined || estado === null ? 1 : Number(estado);
 
     if (![0, 1].includes(estadoNum)) {
@@ -69,7 +86,9 @@ export const validarSku = (req, res, next) => {
 
     // Normalización
     req.body.codigo_sku = codigo;
-    req.body.calidad = calidad.trim().toUpperCase();
+    // En la calidad sí se conservan los espacios internos ("PRIMERA ESPECIAL"),
+    // solo se colapsan los repetidos.
+    req.body.calidad = calidad.trim().toUpperCase().replace(/\s+/g, " ");
     req.body.turno = turnoNum;
     req.body.estado = estadoNum;
 

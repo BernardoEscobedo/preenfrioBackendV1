@@ -1,3 +1,5 @@
+import { aFechaISO, esFechaFutura } from "../utils/fechas.js";
+
 // ============================================================================
 // VALIDACIONES DE MOVIMIENTOS DE INVENTARIO
 // ============================================================================
@@ -10,6 +12,10 @@
 //   una cámara y suma a otra. Un número mal capturado no genera un error
 //   visible: genera inventario fantasma en una cámara y un faltante en la
 //   otra. Nadie lo nota hasta el conteo físico.
+//
+// CORRECCIÓN DE LA AUDITORÍA
+//   "Fecha futura" se evalúa en la zona de operación y comparando texto.
+//   Antes, en Tapachula, la fecha de MAÑANA pasaba la validación.
 // ============================================================================
 
 /**
@@ -22,6 +28,8 @@
  * con el doble de fruta de la que llegó.
  */
 const TIPOS_PERMITIDOS = [2]; // 2 = preenfrío → conservación
+
+const REGEX_HORA = /^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/;
 
 export const validarMovimiento = (req, res, next) => {
     const {
@@ -75,20 +83,16 @@ export const validarMovimiento = (req, res, next) => {
         });
     }
 
-    const fecha = new Date(fecha_movimiento);
+    const fecha = aFechaISO(fecha_movimiento);
 
-    if (isNaN(fecha.getTime())) {
+    if (!fecha) {
         return res.status(400).json({
             error: 'El campo "fecha_movimiento" no es una fecha válida (usa AAAA-MM-DD)'
         });
     }
 
-    // Mover fruta "mañana" es siempre error de captura. Se compara contra
-    // el final del día de hoy para no pelear con zonas horarias.
-    const finDeHoy = new Date();
-    finDeHoy.setHours(23, 59, 59, 999);
-
-    if (fecha > finDeHoy) {
+    // Mover fruta "mañana" es siempre error de captura.
+    if (esFechaFutura(fecha)) {
         return res.status(400).json({
             error: "La fecha del movimiento no puede ser futura"
         });
@@ -101,7 +105,7 @@ export const validarMovimiento = (req, res, next) => {
         });
     }
 
-    if (!/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(String(hora_movimiento))) {
+    if (!REGEX_HORA.test(String(hora_movimiento))) {
         return res.status(400).json({
             error: 'El campo "hora_movimiento" debe tener formato HH:MM o HH:MM:SS'
         });
@@ -185,6 +189,7 @@ export const validarMovimiento = (req, res, next) => {
     req.body.tipo_movimiento = tipoNum;
     req.body.id_ocupacion_origen = Number(id_ocupacion_origen);
     req.body.id_camara_destino = Number(id_camara_destino);
+    req.body.fecha_movimiento = fecha;
     req.body.cantidad_tarimas = tarimas;
     req.body.cantidad_cajas = cajas;
     req.body.temperatura = tempNum;
@@ -237,30 +242,25 @@ export const validarReversa = (req, res, next) => {
     let fechaNorm = null;
 
     if (fecha) {
-        const f = new Date(fecha);
+        fechaNorm = aFechaISO(fecha);
 
-        if (isNaN(f.getTime())) {
+        if (!fechaNorm) {
             return res.status(400).json({
                 error: 'El campo "fecha" no es una fecha válida (usa AAAA-MM-DD)'
             });
         }
 
-        const finDeHoy = new Date();
-        finDeHoy.setHours(23, 59, 59, 999);
-
-        if (f > finDeHoy) {
+        if (esFechaFutura(fechaNorm)) {
             return res.status(400).json({
                 error: "La fecha de la reversa no puede ser futura"
             });
         }
-
-        fechaNorm = fecha;
     }
 
     let horaNorm = null;
 
     if (hora) {
-        if (!/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(String(hora))) {
+        if (!REGEX_HORA.test(String(hora))) {
             return res.status(400).json({
                 error: 'El campo "hora" debe tener formato HH:MM o HH:MM:SS'
             });

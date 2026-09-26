@@ -1,4 +1,5 @@
 import { db } from "../database/connection.database.js";
+import { SQL_CAMARAS_REALES } from "../utils/camarasReales.sql.js";
 
 // ============================================================================
 // BLOQUES FÍSICOS DE FRUTA
@@ -23,10 +24,15 @@ import { db } from "../database/connection.database.js";
 //   escribe: si lo hiciera, el número podría dejar de cuadrar con sus
 //   propias líneas.
 //
-// SIN ALCANCE DIRECTO POR CÁMARA
-//   bloques_fruta no tiene id_camara: el bloque se define por su contenido,
-//   y su contenido apunta a producción. El alcance se resuelve por las
-//   cámaras de las producciones que lo componen, igual que en despachos.
+// ALCANCE POR CÁMARA
+//   bloques_fruta no tiene id_camara: el bloque se define por su contenido.
+//
+//   CORRECCIÓN DE LA AUDITORÍA · SE USA LA CÁMARA REAL, NO LA PLANEADA
+//   Antes el alcance salía de produccion.id_camara, que es el plan. Si en
+//   el andén desviaban el camión a otra cámara, el supervisor de donde
+//   realmente estaba la fruta no podía ver su bloque. Ahora se usa
+//   SQL_CAMARAS_REALES: donde se recibió, a donde se trasladó, y la
+//   planeada solo mientras no haya llegado nada.
 // ============================================================================
 
 const SELECT_BLOQUE = `
@@ -63,9 +69,9 @@ const SELECT_BLOQUE = `
 // ----------------------------------------------------------------------------
 // Listado
 // ----------------------------------------------------------------------------
-// El alcance filtra por las cámaras donde está la fruta que compone el
-// bloque. Un bloque sin detalle todavía no tiene planta asignada, así que
-// pasa siempre: es el borrador que se está armando.
+// El alcance filtra por las cámaras donde REALMENTE está la fruta que
+// compone el bloque. Un bloque sin detalle todavía no tiene planta
+// asignada, así que pasa siempre: es el borrador que se está armando.
 const getBloques = async (
     { estado = null, fecha_desde = null, fecha_hasta = null, buscar = null } = {},
     camaras = null
@@ -83,8 +89,9 @@ const getBloques = async (
                   SELECT 1
                   FROM bloques_produccion_detalle d
                   JOIN produccion p ON p.id_produccion = d.id_produccion
+                  CROSS JOIN LATERAL (${SQL_CAMARAS_REALES("p")}) AS cr(id_camara)
                   WHERE d.id_bloque = b.id_bloque
-                    AND p.id_camara = ANY($5)
+                    AND cr.id_camara = ANY($5)
               )
               OR NOT EXISTS (
                   SELECT 1 FROM bloques_produccion_detalle d
@@ -126,6 +133,9 @@ const existeCodigo = async (codigo_bloque, id_excluir = null) => {
 // ----------------------------------------------------------------------------
 // Qué procesos lo forman y con cuántas tarimas cada uno. Es lo que permite
 // que un pulpeo sobre el montón se desglose por lote.
+//
+// Trae la cámara planeada (nombre_camara) y las cámaras reales
+// (camaras_reales): si no coinciden, el camión se desvió en el andén.
 const getDetalle = async (id_bloque) => {
     const result = await db.query(
         `
@@ -141,6 +151,15 @@ const getDetalle = async (id_bloque) => {
             (CURRENT_DATE - p.fecha_empaque) AS dias_desde_empaque,
             p.id_camara,
             cam.nombre_camara,
+            ARRAY(
+                SELECT c2.nombre_camara
+                FROM camaras c2
+                WHERE c2.id_camara IN (
+                    SELECT cr.id_camara
+                    FROM (${SQL_CAMARAS_REALES("p")}) AS cr(id_camara)
+                )
+                ORDER BY c2.nombre_camara
+            ) AS camaras_reales,
             f.codigo_finca,
             f.nombre  AS nombre_finca,
             pr.nombre AS nombre_productor,
@@ -163,17 +182,33 @@ const getDetalle = async (id_bloque) => {
     return result.rows;
 };
 
-// Cámaras donde está la fruta de este bloque. El controller la usa para
-// validar el alcance, igual que en despachos.
+// Cámaras donde está la fruta de este bloque. La usan bloques.controller
+// y pulpeos.controller para validar el alcance.
 const getCamarasDelBloque = async (id_bloque) => {
     const result = await db.query(
         `
-        SELECT DISTINCT p.id_camara
+        SELECT DISTINCT cr.id_camara
         FROM bloques_produccion_detalle d
         JOIN produccion p ON p.id_produccion = d.id_produccion
-        WHERE d.id_bloque = $1 AND p.id_camara IS NOT NULL
+        CROSS JOIN LATERAL (${SQL_CAMARAS_REALES("p")}) AS cr(id_camara)
+        WHERE d.id_bloque = $1
         `,
         [id_bloque]
+    );
+    return result.rows.map((r) => Number(r.id_camara));
+};
+
+// Cámaras donde está la fruta de UNA producción. La usa el controller al
+// agregar una línea, antes de que la producción forme parte del bloque.
+const getCamarasDeProduccion = async (id_produccion) => {
+    const result = await db.query(
+        `
+        SELECT DISTINCT cr.id_camara
+        FROM produccion p
+        CROSS JOIN LATERAL (${SQL_CAMARAS_REALES("p")}) AS cr(id_camara)
+        WHERE p.id_produccion = $1
+        `,
+        [id_produccion]
     );
     return result.rows.map((r) => Number(r.id_camara));
 };
@@ -210,7 +245,7 @@ const updateBloque = async (
         `
         UPDATE bloques_fruta
         SET codigo_bloque = $2,
-            fecha_hora_armado = $3,
+            fecha_hora_armado = COALESCE($3, fecha_hora_armado),
             temperatura_ingreso = $4
         WHERE id_bloque = $1
         RETURNING *
@@ -299,10 +334,18 @@ const quitarLinea = async (id_detalle) => {
     return result.rows[0];
 };
 
+// Una línea con las cámaras reales de su producción, para validar el
+// alcance al editarla o quitarla.
 const getLineaById = async (id_detalle) => {
     const result = await db.query(
         `
-        SELECT d.*, p.codigo_lote, p.id_camara
+        SELECT
+            d.*,
+            p.codigo_lote,
+            ARRAY(
+                SELECT cr.id_camara
+                FROM (${SQL_CAMARAS_REALES("p")}) AS cr(id_camara)
+            ) AS camaras
         FROM bloques_produccion_detalle d
         JOIN produccion p ON p.id_produccion = d.id_produccion
         WHERE d.id_detalle = $1
@@ -347,6 +390,7 @@ const bloquesModel = {
     existeCodigo,
     getDetalle,
     getCamarasDelBloque,
+    getCamarasDeProduccion,
     createBloque,
     updateBloque,
     desarmarBloque,

@@ -9,6 +9,16 @@ import { db } from "../database/connection.database.js";
 //
 // 'turno' y 'zona' son descriptivos: no afectan permisos ni alcance. Quién
 // ve qué cámaras se define en usuarios_camaras.
+//
+// CORRECCIÓN DE LA AUDITORÍA
+//   Desde la v2.2 la tabla tiene 'estado' (1 activo · 0 dado de baja), pero
+//   el dropdown del alta de usuarios seguía ofreciendo empleados dados de
+//   baja: se le podía crear una cuenta a alguien que ya no trabaja aquí.
+//   getSinUsuario ahora filtra estado = 1.
+//
+//   El listado general sí trae a todos: es la pantalla donde se administra
+//   el catálogo, y ahí hay que poder ver a los dados de baja. Salen al
+//   final.
 // ============================================================================
 
 // Lista con indicador de si ya tiene cuenta.
@@ -24,7 +34,7 @@ const getEmpleados = async () => {
             u.usuario
         FROM empleados e
         LEFT JOIN usuarios u ON u.id_empleado = e.id_empleado
-        ORDER BY e.nombre, e.apellidos
+        ORDER BY e.estado DESC, e.nombre, e.apellidos
         `
     );
     return result.rows;
@@ -38,8 +48,8 @@ const getEmpleadoById = async (id_empleado) => {
     return result.rows[0];
 };
 
-// Empleados que AÚN no tienen cuenta. Alimenta el dropdown del alta de
-// usuarios.
+// Empleados ACTIVOS que aún no tienen cuenta. Alimenta el dropdown del alta
+// de usuarios: no tiene sentido ofrecer a alguien dado de baja.
 const getSinUsuario = async () => {
     const result = await db.query(
         `
@@ -47,6 +57,7 @@ const getSinUsuario = async () => {
         FROM empleados e
         LEFT JOIN usuarios u ON u.id_empleado = e.id_empleado
         WHERE u.id_usuario IS NULL
+          AND e.estado = 1
         ORDER BY e.nombre, e.apellidos
         `
     );

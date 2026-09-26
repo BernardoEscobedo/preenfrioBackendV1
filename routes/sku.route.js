@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { skuController } from "../controllers/sku.controller.js";
+import skuModel from "../models/sku.model.js";
 import { validarSku, validarIdSku } from "../middlewares/sku.middleware.js";
+import { conservarCampos } from "../middlewares/conservar.middleware.js";
 import {
     verifyToken,
     verifyAdmin,
@@ -50,7 +52,18 @@ router.get("/:id", verifyToken, verifyOperativo, validarIdSku, skuController.get
 // en SEGUNDA son dos SKU válidos con turnos distintos.
 router.post("/", verifyToken, verifyCoordinador, validarSku, skuController.createSku);
 
-router.put("/:id", verifyToken, verifyCoordinador, validarIdSku, validarSku, skuController.updateSku);
+// conservarCampos va ANTES del validador. Sin él, editar un SKU de turno 2
+// sin mandar 'turno' lo regresaba a turno 1, y cambiaba el último dígito de
+// todos los lotes que se generaran después.
+router.put(
+    "/:id",
+    verifyToken,
+    verifyCoordinador,
+    validarIdSku,
+    conservarCampos(skuModel.getSkuById, ["turno", "estado"]),
+    validarSku,
+    skuController.updateSku
+);
 
 // ---- Baja lógica (vía normal) ----
 router.delete("/:id", verifyToken, verifyCoordinador, validarIdSku, skuController.bajaSku);

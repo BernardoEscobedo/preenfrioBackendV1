@@ -17,22 +17,22 @@ import camarasModel from "../models/camaras.model.js";
 //   cámara DESTINO. La de ORIGEN sale de la ocupación, no del body, y la
 //   valida este controller.
 //
-// ────────────────────────────────────────────────────────────────────────
 // v2.5 · LA CORRECCIÓN ES POR MOVIMIENTO INVERSO
-// ────────────────────────────────────────────────────────────────────────
-//   Con el trigger nuevo, borrar un movimiento sí devuelve la fruta. Pero
-//   la vía recomendada sigue siendo el INVERSO, por una razón que no es
-//   técnica sino de auditoría:
+//   Borrar un movimiento sí devuelve la fruta, pero la vía recomendada
+//   sigue siendo el INVERSO, por auditoría:
 //
 //     DELETE    la fila desaparece y con ella la evidencia del error
 //     INVERSO   quedan las dos filas, con fecha, usuario y motivo
 //
-//   Un inventario que cuadra no es suficiente: hay que poder explicar CÓMO
-//   llegó a cuadrar. Es el mismo criterio de los pulpeos, donde una lectura
-//   errónea se cancela en vez de borrarse.
+//   POST /:id/revertir es la operación normal (supervisor) y DELETE queda
+//   reservado a admin, para filas que nunca debieron existir.
 //
-//   Por eso POST /:id/revertir es la operación normal (supervisor) y
-//   DELETE queda reservado a admin, para filas que nunca debieron existir.
+// CORRECCIÓN DE LA AUDITORÍA · REVERTIR EXIGE LAS DOS CÁMARAS
+//   Para LEER basta con tener una de las dos cámaras: si el traslado llegó
+//   a la tuya, es asunto tuyo. Pero revertirlo mete fruta en la cámara de
+//   origen. Con el criterio de lectura, un supervisor que solo tenía la
+//   conserva podía meter fruta a un preenfrío de otra planta. Ahora
+//   revertir exige acceso a ambas, igual que crear el traslado.
 // ============================================================================
 
 // GET /api/preenfrio/movimientos?tipo_movimiento=2&fecha_desde=...
@@ -69,7 +69,7 @@ const getMovimientos = async (req, res) => {
 };
 
 /**
- * Valida acceso a un movimiento.
+ * Acceso para LEER un movimiento.
  * Basta con tener UNA de las dos cámaras: si el traslado llegó a la tuya,
  * es asunto tuyo aunque haya salido de otra planta.
  */
@@ -85,6 +85,19 @@ const tieneAcceso = (movimiento, camaras) => {
         camaras.includes(Number(movimiento.id_camara_destino));
 
     return origen || destino;
+};
+
+/**
+ * Acceso para MODIFICAR el inventario a partir de un movimiento.
+ * Exige las DOS cámaras: revertir saca fruta de una y la mete en la otra.
+ * Devuelve la lista de cámaras que faltan (vacía si todo cuadra).
+ */
+const camarasSinAcceso = (movimiento, camaras) => {
+    if (!Array.isArray(camaras)) return [];
+
+    return [movimiento.id_camara_origen, movimiento.id_camara_destino]
+        .filter((c) => c !== null && c !== undefined)
+        .filter((c) => !camaras.includes(Number(c)));
 };
 
 // GET /api/preenfrio/movimientos/:id
@@ -110,7 +123,9 @@ const getMovimientoById = async (req, res) => {
         res.status(200).json({
             ...movimiento,
             revertido: Boolean(reversa),
-            reversa: reversa ?? null
+            reversa: reversa ?? null,
+            // La pantalla lo usa para habilitar o no el botón de revertir
+            puede_revertir: camarasSinAcceso(movimiento, req.camaras).length === 0
         });
     } catch (error) {
         console.error("Error al obtener el movimiento:", error);
@@ -367,9 +382,23 @@ const revertirMovimiento = async (req, res) => {
             return res.status(404).json({ error: "Movimiento no encontrado" });
         }
 
+        // Primero el criterio de lectura: si no ve ninguna de las dos
+        // cámaras, para él el movimiento no existe.
         if (!tieneAcceso(original, req.camaras)) {
             return res.status(403).json({
                 error: "No tienes acceso a ese movimiento"
+            });
+        }
+
+        // ---- Revertir exige las DOS cámaras ----
+        // Revertir saca fruta de la conserva y la mete al preenfrío de
+        // origen. Con solo una de las dos, podría meter fruta a una planta
+        // ajena.
+        const faltantes = camarasSinAcceso(original, req.camaras);
+
+        if (faltantes.length > 0) {
+            return res.status(403).json({
+                error: `Para revertir este traslado necesitas acceso a "${original.camara_origen}" y a "${original.camara_destino}": la fruta sale de una y entra a la otra. Pídele a coordinación que lo revierta.`
             });
         }
 
@@ -408,17 +437,39 @@ const revertirMovimiento = async (req, res) => {
         // reversa dejaría el destino en negativo (el trigger lo corta con
         // GREATEST, pero el resultado sería inventario inventado en el
         // origen).
-        const tablero = await ocupacionesModel.getTablero(
+        const tableroDestino = await ocupacionesModel.getTablero(
             {},
             [Number(original.id_camara_destino)]
         );
 
-        const enDestino = Number(tablero[0]?.tarimas_ocupadas ?? 0);
+        const enDestino = Number(tableroDestino[0]?.tarimas_ocupadas ?? 0);
 
         if (enDestino < Number(original.cantidad_tarimas)) {
             return res.status(409).json({
                 error: `No se puede revertir: el movimiento trasladó ${original.cantidad_tarimas} tarimas a "${original.camara_destino}", pero ahí solo quedan ${enDestino}. Esa fruta ya se movió o se despachó.`
             });
+        }
+
+        // ---- Espacio en el preenfrío al que regresa ----
+        // Se avisa pero no se bloquea: la fruta ya está físicamente de
+        // vuelta en el andén, el sistema tiene que reflejarlo.
+        const tableroOrigen = await ocupacionesModel.getTablero(
+            {},
+            [Number(original.id_camara_origen)]
+        );
+
+        const libresOrigen = Number(
+            tableroOrigen[0]?.tarimas_disponibles_operativas ?? 0
+        );
+
+        const avisos = [
+            "Ambos movimientos quedan en la bitácora. La trazabilidad del lote mostrará el traslado y su corrección."
+        ];
+
+        if (Number(original.cantidad_tarimas) > libresOrigen) {
+            avisos.push(
+                `⚠️ "${original.camara_origen}" solo tiene ${libresOrigen} espacios libres y regresan ${original.cantidad_tarimas} tarimas: quedará sobreocupada.`
+            );
         }
 
         // ---- Crear el inverso ----
@@ -446,9 +497,7 @@ const revertirMovimiento = async (req, res) => {
                 a: original.camara_destino
             },
             reversa: completo,
-            avisos: [
-                "Ambos movimientos quedan en la bitácora. La trazabilidad del lote mostrará el traslado y su corrección."
-            ]
+            avisos
         });
     } catch (error) {
         console.error("Error al revertir el movimiento:", error);
@@ -521,8 +570,6 @@ const deleteMovimiento = async (req, res) => {
         res.status(200).json({
             mensaje: "Movimiento eliminado de la bitácora",
             movimiento: eliminado,
-            // v2.5: el aviso anterior decía lo contrario. Ahora el trigger
-            // SÍ devuelve la fruta.
             resultado: `El inventario se revirtió automáticamente: ${movimiento.cantidad_tarimas} tarima(s) regresaron a "${movimiento.camara_origen}".`,
             avisos: [
                 "⚠️ La fila se eliminó de la bitácora: no queda registro de que este traslado ocurrió. Para correcciones que deban ser auditables, usa POST /:id/revertir."

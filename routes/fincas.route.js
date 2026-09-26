@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { fincasController } from "../controllers/fincas.controller.js";
+import fincasModel from "../models/fincas.model.js";
 import { validarFinca, validarIdFinca } from "../middlewares/fincas.middleware.js";
+import { conservarCampos } from "../middlewares/conservar.middleware.js";
 import {
     verifyToken,
     verifyCoordinador,
@@ -36,7 +38,17 @@ router.get("/:id", verifyToken, verifyOperativo, validarIdFinca, fincasControlle
 // código no se repita dentro de ese mismo productor
 router.post("/", verifyToken, verifyCoordinador, validarFinca, fincasController.createFinca);
 
-router.put("/:id", verifyToken, verifyCoordinador, validarIdFinca, validarFinca, fincasController.updateFinca);
+// conservarCampos va ANTES del validador: si el formulario no manda
+// 'estado', se conserva el actual en vez de reactivar la finca.
+router.put(
+    "/:id",
+    verifyToken,
+    verifyCoordinador,
+    validarIdFinca,
+    conservarCampos(fincasModel.getFincaById, ["estado"]),
+    validarFinca,
+    fincasController.updateFinca
+);
 
 // ---- Baja ----
 // Lógica (estado = 0): produccion.id_finca sigue apuntando aquí

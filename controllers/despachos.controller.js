@@ -15,8 +15,10 @@ import cedisModel from "../models/cedis.model.js";
 //   movimiento tipo 3; ese movimiento dispara el trigger que descuenta la
 //   cámara. Una sola vía de descuento.
 //
-//   Quitar una línea llama a fn_quitar_linea_despacho, que revierte todo en
-//   una operación atómica. Es la única reversa completa del sistema.
+//   Quitar una línea llama a fn_quitar_linea_despacho, que borra la línea y
+//   su movimiento; trg_revertir_movimiento (v2.5) devuelve la fruta. Una
+//   sola vía de reversa: desde la v2.5 recepciones, movimientos y
+//   mantenimientos también tienen la suya en la BD.
 //
 // ⚠️ LA FUNCIÓN DE REVERSA DEVUELVE TEXTO, NO EXCEPCIÓN
 //   fn_quitar_linea_despacho regresa 'OK: ...' o el motivo del rechazo. Sin
@@ -27,6 +29,12 @@ import cedisModel from "../models/cedis.model.js";
 //   El despacho no tiene cámara: la tienen sus líneas. Un despacho ya
 //   armado pertenece a quien puso la fruta; uno vacío todavía no tiene
 //   planta asignada, así que cualquiera puede continuarlo.
+//
+// NOTA DE LA AUDITORÍA
+//   El aviso de "fruta planeada para otro cliente" al agregar una línea no
+//   salía nunca: ocupacionesModel.getOcupacionById no devolvía id_cc. Se
+//   corrigió en el model (primera entrega); este controller no cambió su
+//   lógica, solo sus comentarios.
 // ============================================================================
 
 /** fn_quitar_linea_despacho marca el éxito con este prefijo. */
@@ -127,7 +135,7 @@ const getDespachoById = async (req, res) => {
 
 // GET /api/preenfrio/despachos/clientes-disponibles
 // Dropdown del picking: solo clientes que REALMENTE tienen fruta en las
-// cámaras del alcance. v2.3: ordenados por criticidad.
+// cámaras del alcance, ordenados por criticidad.
 const getClientesDisponibles = async (req, res) => {
     try {
         const clientes = await despachosModel.getClientesConInventario(req.camaras);
@@ -187,8 +195,7 @@ const getDisponible = async (req, res) => {
 // POST /api/preenfrio/despachos
 // ----------------------------------------------------------------------------
 // Crea el documento en borrador. El folio lo genera la BD con la secuencia,
-// no el backend: dos despachos simultáneos tomarían el mismo número si se
-// calculara con MAX(folio)+1.
+// no el backend.
 const createDespacho = async (req, res) => {
     try {
         const { id_transporte, id_cc } = req.body;
@@ -222,10 +229,8 @@ const createDespacho = async (req, res) => {
         const nuevo = await despachosModel.createDespacho(req.body);
         const completo = await despachosModel.getDespachoById(nuevo.id_despacho);
 
-        // La inocuidad se avisa al crear y se BLOQUEA al cerrar: en el
-        // bloque 4 quedó que el catálogo solo la registra y el bloqueo duro
-        // vive aquí. Avisar desde el borrador da tiempo de resolverlo antes
-        // de cargar el camión.
+        // La inocuidad se avisa al crear y se BLOQUEA al cerrar. Avisar
+        // desde el borrador da tiempo de resolverlo antes de cargar.
         const avisos = [];
 
         if (Number(transporte.inocuidad) === 0) {
@@ -288,7 +293,7 @@ const updateDespacho = async (req, res) => {
             });
         }
 
-        const actualizado = await despachosModel.updateDespacho(id, req.body);
+        await despachosModel.updateDespacho(id, req.body);
         const completo = await despachosModel.getDespachoById(id);
 
         // ---- Auditoría de la corrección ----
@@ -378,8 +383,7 @@ const agregarLinea = async (req, res) => {
             });
         }
 
-        // Solo se despacha lo que está DENTRO. La cola sigue en el patio:
-        // primero tiene que ingresar a la cámara.
+        // Solo se despacha lo que está DENTRO. La cola sigue en el patio.
         if (origen.tipo_ocupacion !== 1) {
             return res.status(409).json({
                 error: `Esa ocupación es "${origen.tipo_texto}". Solo se puede despachar fruta que ya está dentro de la cámara.`
@@ -435,11 +439,9 @@ const agregarLinea = async (req, res) => {
         const avisos = [];
 
         // Fruta de otro cliente: legítimo cuando se reasigna, pero es el
-        // error que cuesta el viaje completo si pasa inadvertido.
-        if (
-            origen.id_cc &&
-            Number(origen.id_cc) !== Number(despacho.id_cc)
-        ) {
+        // error que cuesta el viaje completo si pasa inadvertido. Se avisa
+        // aquí y se bloquea al cerrar.
+        if (origen.id_cc && Number(origen.id_cc) !== Number(despacho.id_cc)) {
             avisos.push(
                 `⚠️ Este lote estaba planeado para ${origen.cliente} - ${origen.cedis}, y el despacho va a ${despacho.cliente} - ${despacho.cedis}. Verifica que la reasignación sea correcta.`
             );
@@ -481,11 +483,10 @@ const agregarLinea = async (req, res) => {
 // ----------------------------------------------------------------------------
 // DELETE /api/preenfrio/despachos/:id/lineas/:id_detalle
 // ----------------------------------------------------------------------------
-// Llama a fn_quitar_linea_despacho: devuelve la fruta a su cámara, reabre
-// la ocupación si se había cerrado y borra el movimiento. Todo atómico.
-//
-// Es la única reversa completa del sistema — a recepciones y movimientos
-// les falta porque sus triggers son AFTER INSERT.
+// Llama a fn_quitar_linea_despacho: verifica que el despacho siga en
+// borrador, borra la línea y su movimiento. Al borrar el movimiento,
+// trg_revertir_movimiento devuelve la fruta a su cámara y reabre la
+// ocupación si se había cerrado.
 const quitarLinea = async (req, res) => {
     try {
         const { id, id_detalle } = req.params;
@@ -604,7 +605,7 @@ const cerrarDespacho = async (req, res) => {
             });
         }
 
-        const cerrado = await despachosModel.cerrarDespacho(id);
+        await despachosModel.cerrarDespacho(id);
         const completo = await despachosModel.getDespachoById(id);
 
         // Si se cerró con reasignación, queda constancia en la auditoría:
@@ -682,8 +683,8 @@ const reabrirDespacho = async (req, res) => {
 // ----------------------------------------------------------------------------
 // DELETE /api/preenfrio/despachos/:id
 // ----------------------------------------------------------------------------
-// Solo borradores vacíos. Con líneas habría que devolver la fruta a las
-// cámaras, y para eso está quitar cada línea con su reversa.
+// Solo borradores vacíos. Con líneas hay que quitar cada una para devolver
+// la fruta a su cámara.
 const deleteDespacho = async (req, res) => {
     try {
         const { id } = req.params;
@@ -734,6 +735,18 @@ const deleteDespacho = async (req, res) => {
 const getAuditoria = async (req, res) => {
     try {
         const { id } = req.params;
+
+        const despacho = await despachosModel.getDespachoById(id);
+
+        if (!despacho) {
+            return res.status(404).json({ error: "Despacho no encontrado" });
+        }
+
+        const problema = await validarAlcanceDespacho(id, req.camaras);
+        if (problema) {
+            return res.status(problema.status).json({ error: problema.error });
+        }
+
         const auditoria = await despachosModel.getAuditoria(id);
         res.status(200).json(auditoria);
     } catch (error) {

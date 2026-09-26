@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { cedisController } from "../controllers/cedis.controller.js";
+import cedisModel from "../models/cedis.model.js";
 import { validarCedis, validarIdCedis } from "../middlewares/cedis.middleware.js";
+import { conservarCampos } from "../middlewares/conservar.middleware.js";
 import {
     verifyToken,
     verifyCoordinador,
@@ -44,7 +46,17 @@ router.get("/:id", verifyToken, verifyOperativo, validarIdCedis, cedisController
 // pareja cliente + cedis, que no lo es pero tampoco debe repetirse.
 router.post("/", verifyToken, verifyCoordinador, validarCedis, cedisController.createCedis);
 
-router.put("/:id", verifyToken, verifyCoordinador, validarIdCedis, validarCedis, cedisController.updateCedis);
+// conservarCampos va ANTES del validador: si el formulario no manda
+// 'estado', se conserva el actual en vez de reactivar el destino.
+router.put(
+    "/:id",
+    verifyToken,
+    verifyCoordinador,
+    validarIdCedis,
+    conservarCampos(cedisModel.getCedisById, ["estado"]),
+    validarCedis,
+    cedisController.updateCedis
+);
 
 // ---- Baja ----
 // Lógica (estado = 0): produccion.id_cc y despachos.id_cc siguen apuntando aquí

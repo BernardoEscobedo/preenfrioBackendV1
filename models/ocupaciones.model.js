@@ -39,6 +39,23 @@ import { db } from "../database/connection.database.js";
 //   Regresan 'OK: ...' o el motivo del rechazo ('La cámara no tiene espacio
 //   disponible'). No lanzan error, así que el controller tiene que LEER la
 //   respuesta para saber si funcionó.
+//
+// CORRECCIONES DE LA AUDITORÍA
+//   · getOcupacionById no devolvía id_cc. despachos.controller lo usa para
+//     avisar cuando se sube al camión fruta planeada para otro cliente:
+//     llegaba undefined y el aviso nunca aparecía. (El cierre sí lo
+//     atrapaba, pero el aviso temprano estaba muerto.)
+//
+//   · getOcupacionById calculaba la holgura con un "- 1" escrito aquí, que
+//     es el mismo DIAS_PREENFRIO de la migración v2.3. Si se ajustaba en la
+//     vista y no aquí, /promover mostraba una holgura distinta a la cola.
+//     Ahora se lee de las vistas: el parámetro existe en un solo lugar.
+//
+//   · getInventario no tenía ORDER BY y confiaba en el orden de la vista.
+//     En PostgreSQL, en cuanto se aplica un WHERE sobre una vista ese orden
+//     deja de estar garantizado: el día que el planificador cambiara de
+//     estrategia, el inventario dejaría de mostrar primero lo crítico sin
+//     que nadie lo notara.
 // ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -117,8 +134,8 @@ const getTablero = async (
 //   3º fecha_empaque ASC     FEFO dentro del mismo nivel
 //   4º llegada               desempate
 //
-// El filtro por nivel permite que la pantalla muestre "solo lo crítico",
-// que es lo que el supervisor quiere ver cuando llega en la mañana.
+// El ORDER BY por 'posicion' es explícito a propósito: el orden de la vista
+// no se garantiza en cuanto se filtra.
 const getCola = async (
     { id_camara = null, nivel_maximo = null } = {},
     camaras = null
@@ -192,9 +209,12 @@ const getCriticas = async (camaras = null) => {
 // está REALMENTE dentro. La cola no aparece porque no se puede despachar
 // fruta que todavía está en el patio.
 //
-// v2.3: el orden ya no es FEFO puro, es criticidad y luego FEFO. Ordenar
-// solo por antigüedad provocaba el error inverso al de la cola: sacar
-// fruta vieja con cita lejana y dejar adentro la que vence mañana.
+// El orden es criticidad y luego FEFO (v2.3). Ordenar solo por antigüedad
+// provocaba el error inverso al de la cola: sacar fruta vieja con cita
+// lejana y dejar adentro la que vence mañana.
+//
+// El ORDER BY va explícito: el de la vista deja de estar garantizado en
+// cuanto se aplica el WHERE.
 const getInventario = async (
     { id_camara = null, id_cc = null, nivel_maximo = null, buscar = null } = {},
     camaras = null
@@ -210,15 +230,30 @@ const getInventario = async (
                OR codigo_lote ILIKE '%' || $5 || '%'
                OR nombre_finca ILIKE '%' || $5 || '%'
                OR cliente ILIKE '%' || $5 || '%')
+        ORDER BY nivel_criticidad ASC,
+                 fecha_empaque ASC NULLS LAST,
+                 id_ocupacion ASC
         `,
         [id_camara, id_cc, camaras, nivel_maximo, buscar]
     );
     return result.rows;
 };
 
-// Una ocupación concreta, con su trazabilidad.
+// ----------------------------------------------------------------------------
+// Una ocupación concreta, con su trazabilidad
+// ----------------------------------------------------------------------------
 // Sin filtro de alcance: el controller compara después para distinguir
 // "no existe" (404) de "no es de tu planta" (403).
+//
+// La usan también movimientos (origen del traslado) y despachos (origen de
+// la línea de picking), por eso trae id_cc: es lo que permite avisar cuando
+// se sube al camión fruta planeada para otro cliente.
+//
+// La holgura y la criticidad se LEEN de las vistas en vez de calcularse
+// aquí, para que el parámetro DIAS_PREENFRIO exista en un solo lugar. Una
+// ocupación en cola la trae vw_cola_espera; una dentro de la cámara,
+// vw_inventario_disponible. Las cerradas y los bloqueos no están en
+// ninguna: para ellas la holgura viene NULL, que es lo correcto.
 const getOcupacionById = async (id_ocupacion) => {
     const result = await db.query(
         `
@@ -249,19 +284,17 @@ const getOcupacionById = async (id_ocupacion) => {
             p.fecha_entrega,
             (p.fecha_entrega - CURRENT_DATE) AS dias_para_cita,
             COALESCE(p.transito, 0) AS transito,
-            -- Misma fórmula que las vistas: días de margen antes de
-            -- incumplir la cita
-            CASE
-                WHEN p.fecha_entrega IS NULL THEN NULL
-                ELSE (p.fecha_entrega - CURRENT_DATE)
-                     - COALESCE(p.transito, 0)
-                     - 1
-            END AS holgura_dias,
+            -- Holgura y criticidad, tal como las calculan las vistas
+            COALESCE(vc.holgura_dias, vi.holgura_dias)         AS holgura_dias,
+            COALESCE(vc.nivel_criticidad, vi.nivel_criticidad) AS nivel_criticidad,
+            COALESCE(vc.criticidad_texto, vi.criticidad_texto) AS criticidad_texto,
             f.codigo_finca,
             f.nombre  AS nombre_finca,
             pr.nombre AS nombre_productor,
             s.codigo_sku,
             s.calidad AS calidad_sku,
+            -- id_cc: el dato que faltaba para el aviso de otro cliente
+            p.id_cc,
             cc.cliente,
             cc.cedis
         FROM ocupaciones_camaras o
@@ -272,6 +305,8 @@ const getOcupacionById = async (id_ocupacion) => {
         LEFT JOIN productores   pr  ON pr.id_productor = p.id_productor
         LEFT JOIN sku_pt        s   ON s.id_sku        = p.id_sku
         LEFT JOIN cedis_cliente cc  ON cc.id_cc        = p.id_cc
+        LEFT JOIN vw_cola_espera           vc ON vc.id_ocupacion = o.id_ocupacion
+        LEFT JOIN vw_inventario_disponible vi ON vi.id_ocupacion = o.id_ocupacion
         WHERE o.id_ocupacion = $1
         `,
         [id_ocupacion]
@@ -286,8 +321,8 @@ const getOcupacionById = async (id_ocupacion) => {
 // CUÁNTAS tarimas, porque él ve el patio: sabe cuál camión está estorbando
 // el andén y cuál fruta se ve peor.
 //
-// La vista SUGIERE el orden con 'posicion' y ahora ese orden ya considera
-// la cita, no solo la antigüedad. El sistema recomienda; la persona decide.
+// La vista SUGIERE el orden con 'posicion' y ese orden ya considera la cita,
+// no solo la antigüedad. El sistema recomienda; la persona decide.
 //
 // La función se encarga de no exceder ni lo que espera ni lo que cabe:
 //     v_tar := LEAST(p_tarimas, v_tar_espera, v_disp)
@@ -313,13 +348,10 @@ const promoverDeCola = async (id_ocupacion, tarimas, fecha = null, hora = null) 
 //   prioridad = 0  → orden normal (por criticidad y luego antigüedad)
 //   prioridad > 0  → urgente; a mayor número, más al frente
 //
-// v2.3: la prioridad manual sigue ganando sobre TODO, incluida la
-// criticidad. Es intencional: el supervisor a veces sabe algo que el
-// sistema no puede calcular (un cliente llamando, un camión ya en el
-// andén, un cambio de cita que aún no se captura).
-//
-// Con la criticidad automática debería necesitarse mucho menos que antes:
-// los casos que antes se resolvían a mano ahora salen solos en el orden.
+// La prioridad manual gana sobre TODO, incluida la criticidad. Es
+// intencional: el supervisor a veces sabe algo que el sistema no puede
+// calcular (un cliente llamando, un camión ya en el andén, un cambio de
+// cita que aún no se captura).
 const setPrioridad = async (id_ocupacion, prioridad, motivo = null) => {
     const result = await db.query(
         `SELECT fn_set_prioridad_cola($1, $2, $3) AS resultado`,

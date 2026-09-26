@@ -33,8 +33,6 @@ const router = Router();
 //   ocupación tipo 2 consumiendo TODA la capacidad. A partir de ahí
 //   fn_tarimas_disponibles devuelve 0 y la fruta que llegue se va a la cola.
 //
-//   Es la respuesta a "¿por qué mi cámara vacía no recibe nada?".
-//
 // ---- LAS TRANSICIONES VAN POR ENDPOINTS SEPARADOS ----
 //   El trigger reacciona distinto a cada estado, así que mezclarlas en un
 //   PUT genérico haría muy fácil bloquear una cámara por accidente al
@@ -44,20 +42,14 @@ const router = Router();
 //     PATCH /:id/finalizar  2 → 3   la libera
 //     DELETE /:id           1 → 4   cancela (solo si nunca inició)
 //
-// ---- EL HUECO DEL TRIGGER: EL ESTADO 4 ----
-//   trg_sync_ocupacion_mantenimiento solo tiene rama para el 2 (bloquear) y
-//   el 3 (liberar). No hay nada para el 4.
+// ---- v2.4 · EL TRIGGER CUBRE LOS TRES CAMINOS ----
+//   El estado 4 también libera la cámara. Aun así, un mantenimiento en
+//   proceso no se puede cancelar: ese paro ocurrió y tiene que quedar en el
+//   histórico de horas de paro. Se cierra con "finalizar".
 //
-//   Si un mantenimiento pasa de 2 a 4, su ocupación tipo 2 queda ACTIVA
-//   para siempre y la cámara nunca se libera. Por eso el controller impide
-//   cancelar uno en proceso: desde ahí solo se puede finalizar.
-//
-//   Para los casos que ya quedaron trabados están:
-//     GET  /bloqueos-huerfanos              diagnóstico
-//     POST /bloqueos/:id_ocupacion/liberar  salida de emergencia (admin)
-//
-//   Se resolvió en el backend porque tocar el trigger exige migración. Si
-//   el caso se vuelve frecuente, lo correcto es agregarle la rama del 4.
+//   GET /bloqueos-huerfanos y POST /bloqueos/:id/liberar se conservan como
+//   diagnóstico para ocupaciones tipo 2 creadas a mano sin mantenimiento
+//   ligado, que el trigger no puede ver.
 //
 // ---- POR QUÉ INICIAR Y FINALIZAR SON SUPERVISOR ----
 //   Es quien está en planta y ve al técnico llegar. Solo puede parar SUS
@@ -75,10 +67,10 @@ const router = Router();
 // ---- Consultas ----
 // Las rutas con prefijo fijo van ANTES de "/:id".
 
-// ⭐ Los que están bloqueando cámaras ahora mismo.
+// Los que están bloqueando cámaras ahora mismo.
 router.get("/activos", verifyToken, verifyOperativo, cargarAlcance, mantenimientosController.getActivos);
 
-// ⭐ Ocupaciones tipo 2 activas sin mantenimiento en proceso que las
+// Ocupaciones tipo 2 activas sin mantenimiento en proceso que las
 // justifique. Diagnóstico de una cámara trabada.
 router.get("/bloqueos-huerfanos", verifyToken, verifyOperativo, cargarAlcance, mantenimientosController.getBloqueosHuerfanos);
 
@@ -95,7 +87,8 @@ router.get("/:id", verifyToken, verifyOperativo, cargarAlcance, validarIdManteni
 
 // ---- Alta ----
 // estado 1 (programado) por defecto. Si nace en 2, la cámara se bloquea de
-// inmediato y la respuesta avisa cuánta fruta quedó atrapada adentro.
+// inmediato y la respuesta avisa cuánta fruta quedó adentro. El middleware
+// rechaza nacer en 2 con fecha futura.
 router.post(
     "/",
     verifyToken,
@@ -121,8 +114,6 @@ router.put(
 
 // ---- Iniciar ----
 // ⚠️ Dispara el bloqueo de TODA la capacidad de la cámara.
-// El controller avisa cuántas tarimas quedaron dentro: el bloqueo no las
-// saca, solo impide que entren más.
 router.patch(
     "/:id/iniciar",
     verifyToken,
@@ -134,8 +125,8 @@ router.patch(
 );
 
 // ---- Finalizar ----
-// Libera la cámara. La respuesta verifica que el trigger haya cerrado la
-// ocupación: si siguiera activa, avisa para no dar por hecho que se liberó.
+// Libera la cámara. El controller rechaza un cierre anterior al inicio y
+// verifica que el trigger haya cerrado la ocupación de bloqueo.
 router.patch(
     "/:id/finalizar",
     verifyToken,
@@ -147,8 +138,7 @@ router.patch(
 );
 
 // ---- Cancelar ----
-// Solo desde 'programado'. Cancelar uno en proceso dejaría la cámara
-// bloqueada permanentemente, así que el controller lo rechaza.
+// Solo desde 'programado'. Uno en proceso se finaliza, no se cancela.
 router.delete("/:id", verifyToken, verifyCoordinador, cargarAlcance, validarIdMantenimiento, mantenimientosController.cancelarMantenimiento);
 
 // ---- Salida de emergencia ----

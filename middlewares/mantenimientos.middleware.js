@@ -1,3 +1,5 @@
+import { aFechaISO, esFechaFutura, hoyISO, sumarDiasISO } from "../utils/fechas.js";
+
 // ============================================================================
 // VALIDACIONES DE MANTENIMIENTOS
 // ============================================================================
@@ -15,6 +17,13 @@
 //   Si en la operación se usan otros, hay que ajustar estas constantes y
 //   los CASE de mantenimientos.model.js: son los dos únicos lugares donde
 //   se traducen a texto.
+//
+// CORRECCIONES DE LA AUDITORÍA
+//   · Las fechas se evalúan en la zona de operación y comparando texto.
+//     Antes, en Tapachula, la fecha de MAÑANA pasaba "no puede ser futura".
+//   · Crear directo en estado 2 (en proceso) con fecha futura bloqueaba la
+//     cámara DESDE AHORA: el trigger no espera a la fecha, bloquea en
+//     cuanto el estado es 2. Si es futuro, se programa (estado 1).
 // ============================================================================
 
 const TIPOS_VALIDOS = [1, 2, 3];        // 1 Preventivo · 2 Correctivo · 3 Emergencia
@@ -24,6 +33,8 @@ const PRIORIDADES_VALIDAS = [1, 2, 3];  // 1 Alta · 2 Media · 3 Baja
 // sentido al dar de alta y el 4 (cancelado) tampoco: para eso está no
 // crearlo.
 const ESTADOS_AL_CREAR = [1, 2];        // 1 Programado · 2 En proceso
+
+const REGEX_HORA = /^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/;
 
 export const validarMantenimiento = (req, res, next) => {
     const {
@@ -50,9 +61,9 @@ export const validarMantenimiento = (req, res, next) => {
         });
     }
 
-    const fecha = new Date(fecha_inicio);
+    const fecha = aFechaISO(fecha_inicio);
 
-    if (isNaN(fecha.getTime())) {
+    if (!fecha) {
         return res.status(400).json({
             error: 'El campo "fecha_inicio" no es una fecha válida (usa AAAA-MM-DD)'
         });
@@ -61,10 +72,7 @@ export const validarMantenimiento = (req, res, next) => {
     // A diferencia de recepciones y movimientos, aquí SÍ se permite fecha
     // futura: los preventivos se agendan con semanas de anticipación. El
     // tope de 180 días atrapa el error de dedo en el año.
-    const limite = new Date();
-    limite.setDate(limite.getDate() + 180);
-
-    if (fecha > limite) {
+    if (fecha > sumarDiasISO(hoyISO(), 180)) {
         return res.status(400).json({
             error: "La fecha de inicio está a más de 180 días: revisa el dato"
         });
@@ -77,7 +85,7 @@ export const validarMantenimiento = (req, res, next) => {
         });
     }
 
-    if (!/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(String(hora_inicio))) {
+    if (!REGEX_HORA.test(String(hora_inicio))) {
         return res.status(400).json({
             error: 'El campo "hora_inicio" debe tener formato HH:MM o HH:MM:SS'
         });
@@ -131,8 +139,18 @@ export const validarMantenimiento = (req, res, next) => {
         });
     }
 
+    // Un paro "en proceso" que empieza en el futuro es una contradicción, y
+    // además bloquearía la cámara desde ahora: el trigger reacciona al
+    // estado, no a la fecha.
+    if (estadoNum === 2 && esFechaFutura(fecha)) {
+        return res.status(400).json({
+            error: "Un mantenimiento con fecha futura no puede nacer 'en proceso': bloquearía la cámara desde ahora. Créalo como programado (estado 1) e inícialo cuando llegue el técnico."
+        });
+    }
+
     // ---- Normalización ----
     req.body.id_camara = Number(id_camara);
+    req.body.fecha_inicio = fecha;
     req.body.tipo = Number(tipo);
     req.body.prioridad = Number(prioridad);
     req.body.estado = estadoNum;
@@ -161,11 +179,11 @@ export const validarEdicionMantenimiento = (req, res, next) => {
         });
     }
 
-    const fecha = new Date(fecha_inicio);
+    const fecha = aFechaISO(fecha_inicio);
 
-    if (isNaN(fecha.getTime())) {
+    if (!fecha) {
         return res.status(400).json({
-            error: 'El campo "fecha_inicio" no es una fecha válida'
+            error: 'El campo "fecha_inicio" no es una fecha válida (usa AAAA-MM-DD)'
         });
     }
 
@@ -175,7 +193,7 @@ export const validarEdicionMantenimiento = (req, res, next) => {
         });
     }
 
-    if (!/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(String(hora_inicio))) {
+    if (!REGEX_HORA.test(String(hora_inicio))) {
         return res.status(400).json({
             error: 'El campo "hora_inicio" debe tener formato HH:MM o HH:MM:SS'
         });
@@ -205,6 +223,7 @@ export const validarEdicionMantenimiento = (req, res, next) => {
         });
     }
 
+    req.body.fecha_inicio = fecha;
     req.body.tipo = Number(tipo);
     req.body.prioridad = Number(prioridad);
     req.body.motivo = motivo.trim();
@@ -218,36 +237,34 @@ export const validarEdicionMantenimiento = (req, res, next) => {
 // Las usan iniciar y finalizar. Ambas opcionales: por defecto se toma el
 // momento actual. Se permiten para registrar algo que pasó hace rato, que
 // en piso ocurre seguido.
+//
+// Que la fecha de fin no quede antes del inicio lo valida el controller,
+// porque necesita el registro existente.
 export const validarFechaTransicion = (req, res, next) => {
     const { fecha, hora } = req.body;
 
     let fechaNorm = null;
 
     if (fecha) {
-        const f = new Date(fecha);
+        fechaNorm = aFechaISO(fecha);
 
-        if (isNaN(f.getTime())) {
+        if (!fechaNorm) {
             return res.status(400).json({
                 error: 'El campo "fecha" no es una fecha válida (usa AAAA-MM-DD)'
             });
         }
 
-        const finDeHoy = new Date();
-        finDeHoy.setHours(23, 59, 59, 999);
-
-        if (f > finDeHoy) {
+        if (esFechaFutura(fechaNorm)) {
             return res.status(400).json({
                 error: "La fecha no puede ser futura"
             });
         }
-
-        fechaNorm = fecha;
     }
 
     let horaNorm = null;
 
     if (hora) {
-        if (!/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(String(hora))) {
+        if (!REGEX_HORA.test(String(hora))) {
             return res.status(400).json({
                 error: 'El campo "hora" debe tener formato HH:MM o HH:MM:SS'
             });

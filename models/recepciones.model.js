@@ -7,35 +7,38 @@ import { db } from "../database/connection.database.js";
 // 1..N con producción: un mismo proceso puede llegar en varios viajes.
 //
 // ⚠️ REGLA DE ORO DE ESTE MÓDULO
-//   Este modelo NUNCA escribe en ocupaciones_camaras. Un INSERT aquí
-//   dispara DOS triggers que hacen todo el trabajo de inventario:
+//   Este modelo NUNCA escribe en ocupaciones_camaras. Tres triggers hacen
+//   todo el trabajo de inventario:
 //
-//     trg_sync_ocupacion_recepcion     mete a la cámara lo que quepa
-//                                      (tipo 1) y manda el excedente a la
-//                                      COLA de esa misma cámara (tipo 3)
+//     trg_sync_ocupacion_recepcion     AL INSERTAR: mete a la cámara lo que
+//                                      quepa (tipo 1), manda el excedente a
+//                                      la COLA (tipo 3) y, desde la v2.5,
+//                                      escribe de vuelta tarimas_ingresadas
+//
+//     trg_revertir_recepcion  (v2.5)   AL CAMBIAR EL ESTADO: si se cancela,
+//                                      descuenta lo que entró y cierra su
+//                                      cola; si se reactiva, lo vuelve a
+//                                      sumar
 //
 //     trg_actualizar_estado_produccion mueve la producción a estado 2
 //                                      (en recepción) o 3 (recibida)
 //
 //   La lógica vive en la BD a propósito: así cualquier origen de datos
 //   —este backend, una importación masiva, una corrección manual en
-//   Supabase— mantiene las ocupaciones cuadradas. Si el backend también
-//   descontara, tendríamos doble descuento en cuanto alguien insertara por
-//   otra vía.
+//   Supabase— mantiene las ocupaciones cuadradas.
 //
 // DIVISIÓN DENTRO / EN ESPERA
 //   tarimas_recibidas   = lo que llegó al andén
-//   tarimas_ingresadas  = lo que ENTRA físicamente a la cámara
+//   tarimas_ingresadas  = lo que ENTRÓ físicamente a la cámara
 //   La diferencia queda en la cola (tipo_ocupacion = 3), esperando espacio.
 //
-//   Si tarimas_ingresadas viene NULL, el trigger calcula automáticamente lo
-//   que quepa con fn_tarimas_disponibles. Si viene con número, se respeta:
-//   el operador vio el patio y decidió.
+//   Si tarimas_ingresadas viene NULL, el trigger calcula lo que quepa con
+//   fn_tarimas_disponibles y lo guarda. Si viene con número, se respeta: el
+//   operador vio el patio y decidió.
 //
 // ALCANCE POR CÁMARA
-//   Igual que producción: los modelos reciben req.camaras y filtran.
-//   La cámara de la recepción puede diferir de la planeada — al llegar el
-//   camión, el supervisor decide dónde cabe realmente.
+//   Los modelos reciben req.camaras y filtran por r.id_camara: la cámara
+//   donde se recibió de verdad, que puede diferir de la planeada.
 // ============================================================================
 
 const SELECT_RECEPCION = `
@@ -70,8 +73,8 @@ const SELECT_RECEPCION = `
             ELSE 'Otro'
         END                   AS estado_texto,
         -- Lo que quedó esperando fuera de la cámara.
-        -- COALESCE porque tarimas_ingresadas admite NULL (el trigger lo
-        -- calculó solo y no lo escribió de vuelta).
+        -- COALESCE por las recepciones anteriores a la v2.5, cuando el
+        -- trigger calculaba lo que entraba pero no lo escribía de vuelta.
         GREATEST(
             r.tarimas_recibidas - COALESCE(r.tarimas_ingresadas, r.tarimas_recibidas),
             0
@@ -175,9 +178,10 @@ const getEsperadas = async (
 // Solo se escribe en 'recepciones'. Las ocupaciones y el estado de la
 // producción los resuelve la BD.
 //
-// tarimas_ingresadas / cajas_ingresadas pueden ir NULL: el trigger calcula
-// lo que quepa. Se mandan con valor cuando el operador confirmó en el modal
-// cuántas tarimas metió de verdad.
+// tarimas_ingresadas puede ir NULL: el trigger calcula lo que quepa y lo
+// guarda. cajas_ingresadas se acepta por contrato con el frontend, pero el
+// trigger reparte las cajas en proporción a las tarimas y sobrescribe el
+// valor.
 const createRecepcion = async ({
     id_produccion,
     id_camara,
@@ -225,13 +229,12 @@ const createRecepcion = async ({
 // Solo se permiten datos administrativos: temperatura y observaciones.
 //
 // POR QUÉ NO SE EDITAN LAS CANTIDADES
-//   trg_sync_ocupacion_recepcion es AFTER INSERT, no AFTER UPDATE. Cambiar
-//   tarimas_recibidas por UPDATE modificaría el número en la tabla pero
-//   NO movería la ocupación correspondiente: la cámara seguiría con las
-//   tarimas originales y el inventario quedaría descuadrado en silencio.
+//   trg_revertir_recepcion reacciona al cambio de ESTADO, no a un cambio de
+//   cantidades. Un UPDATE de tarimas_recibidas cambiaría el número en la
+//   tabla sin mover la ocupación correspondiente.
 //
-//   Si la cantidad estuvo mal, se cancela la recepción y se captura otra.
-//   Es más trabajo, pero deja rastro de la corrección.
+//   Si la cantidad estuvo mal, se cancela la recepción (eso sí libera la
+//   cámara) y se captura otra. Además deja rastro de la corrección.
 const updateRecepcion = async (
     id_recepcion,
     { temperatura, observaciones }
@@ -251,17 +254,14 @@ const updateRecepcion = async (
 // ----------------------------------------------------------------------------
 // Cancelación
 // ----------------------------------------------------------------------------
-// estado = 0. Dispara trg_actualizar_estado_produccion (que solo suma las
-// recepciones activas), así que la producción recalcula su estado sola.
+// estado = 0. Dispara dos triggers:
+//   · trg_revertir_recepcion (v2.5) descuenta de la cámara lo que esta
+//     recepción metió y cierra su fila de cola
+//   · trg_actualizar_estado_produccion recalcula el estado de la producción
 //
-// ⚠️ LO QUE ESTO **NO** HACE
-//   NO devuelve las tarimas de la cámara. trg_sync_ocupacion_recepcion es
-//   AFTER INSERT: al cancelar no se dispara nada que revierta la ocupación.
-//
-//   Es una limitación conocida del esquema. El controller avisa en la
-//   respuesta para que el supervisor ajuste el inventario a mano o con un
-//   movimiento. Documentarlo es mejor que simularlo: si el backend
-//   descontara por su cuenta, tendríamos dos fuentes de verdad peleándose.
+// Si parte de esa fruta ya se movió a conservación o se despachó, la cámara
+// solo descuenta lo que todavía tiene (el trigger corta con GREATEST para no
+// quedar en negativo). El controller compara antes y después para avisarlo.
 const cancelarRecepcion = async (id_recepcion) => {
     const result = await db.query(
         `
@@ -274,6 +274,9 @@ const cancelarRecepcion = async (id_recepcion) => {
     return result.rows[0];
 };
 
+// Reactivar: trg_revertir_recepcion vuelve a sumar lo que había entrado. Lo
+// que estaba en cola se suma directo a la cámara: la fila de espera no se
+// reconstruye porque ya no se conoce su lugar en el orden.
 const reactivarRecepcion = async (id_recepcion) => {
     const result = await db.query(
         `
@@ -289,9 +292,13 @@ const reactivarRecepcion = async (id_recepcion) => {
 // ----------------------------------------------------------------------------
 // Ocupaciones generadas por una recepción
 // ----------------------------------------------------------------------------
-// Permite ver qué hicieron los triggers: cuánto entró a cámara (tipo 1) y
-// cuánto quedó en cola (tipo 3). Es la herramienta de diagnóstico cuando
-// alguien pregunta "¿por qué mi fruta no está dentro?".
+// Permite ver qué hicieron los triggers. Es la herramienta de diagnóstico
+// cuando alguien pregunta "¿por qué mi fruta no está dentro?".
+//
+// ⚠️ La ocupación tipo 1 es COMPARTIDA entre todas las recepciones de la
+// cámara y solo lleva el id de la primera que la creó. Por eso, para la
+// segunda recepción en adelante, aquí solo aparece su fila de cola (si la
+// hubo). Lo que entró se lee de recepciones.tarimas_ingresadas.
 const getOcupacionesGeneradas = async (id_recepcion) => {
     const result = await db.query(
         `
@@ -323,9 +330,11 @@ const getOcupacionesGeneradas = async (id_recepcion) => {
     return result.rows;
 };
 
-// Capacidad libre de una cámara, ANTES de recibir.
-// El controller la consulta para avisar cuánto va a quedar en cola si el
-// camión trae más de lo que cabe.
+// Capacidad de una cámara.
+//
+// ⚠️ Para comparar antes/después usa tarimas_ocupadas, no
+// tarimas_disponibles: la segunda sale de fn_tarimas_disponibles, que nunca
+// baja de 0 y vale 0 en mantenimiento.
 const getDisponibilidad = async (id_camara) => {
     const result = await db.query(
         `

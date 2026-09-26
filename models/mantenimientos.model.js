@@ -13,29 +13,25 @@ import { db } from "../database/connection.database.js";
 //     estado → 2 (en proceso)  crea una ocupación tipo 2 que consume TODA
 //                              la capacidad de la cámara
 //     estado → 3 (finalizado)  cierra esa ocupación y libera la cámara
+//     estado → 4 (cancelado)   también la cierra (v2.4)
 //
 //   Mientras existe esa ocupación, fn_tarimas_disponibles devuelve 0 aunque
 //   la cámara esté vacía. Es la respuesta a "¿por qué toda la fruta se fue
 //   a la cola si había espacio?".
 //
-// ⚠️ EL TRIGGER NO MANEJA EL ESTADO 4 (CANCELADO)
-//   Solo tiene dos ramas: bloquear en 2 y liberar en 3. Si un mantenimiento
-//   pasa de 2 a 4, la ocupación tipo 2 queda ACTIVA para siempre y la
-//   cámara nunca se libera.
+// v2.4 · EL HUECO DEL ESTADO 4 YA ESTÁ CERRADO
+//   Antes el trigger no tenía rama para el 4 y cancelar un mantenimiento en
+//   proceso dejaba la cámara trabada para siempre. La migración v2.4 agregó
+//   la rama y liberó los bloqueos que habían quedado huérfanos.
 //
-//   El controller lo impide: desde 'en proceso' solo se puede finalizar,
-//   nunca cancelar. Cancelar queda reservado a los que siguen programados
-//   (estado 1), que todavía no bloquearon nada.
-//
-//   Se resolvió en el backend y no en la BD porque tocar el trigger exige
-//   una migración; si el caso se vuelve frecuente, la solución correcta es
-//   agregarle la rama del 4.
+//   El controller sigue impidiendo cancelar uno en proceso, pero ahora por
+//   el dato, no por la BD: ese paro ocurrió y debe quedar en el histórico.
 //
 // ESTADOS
 //   1 = programado   agendado, la cámara sigue operando
 //   2 = en proceso   bloquea TODA la capacidad
 //   3 = finalizado   libera la cámara
-//   4 = cancelado    solo desde 'programado'
+//   4 = cancelado    solo desde 'programado' (criterio del controller)
 //
 // ALCANCE
 //   La tabla SÍ tiene id_camara, así que es el caso simple:
@@ -161,8 +157,10 @@ const getActivos = async (camaras = null) => {
 };
 
 // Mantenimiento activo de una cámara concreta.
-// El controller lo consulta antes de iniciar otro: dos ocupaciones tipo 2
-// sobre la misma cámara dejarían una huérfana al finalizar la primera.
+// El controller lo consulta antes de iniciar otro: dos mantenimientos en
+// proceso sobre la misma cámara dejarían uno sin ocupación de bloqueo
+// propia, y al finalizar el primero la cámara se liberaría con otro paro
+// todavía abierto.
 const getActivoPorCamara = async (id_camara, excluir_id = null) => {
     const result = await db.query(
         `
@@ -277,9 +275,9 @@ const updateMantenimiento = async (
 // estado → 2. El trigger crea la ocupación tipo 2 que bloquea TODA la
 // capacidad de la cámara.
 //
-// También se actualiza la fecha de inicio: si el mantenimiento se programó
-// para las 8 y empezó a las 10, lo que importa para medir el paro es la
-// hora real.
+// También se actualiza la fecha de inicio si viene: si el mantenimiento se
+// programó para las 8 y empezó a las 10, lo que importa para medir el paro
+// es la hora real.
 const iniciarMantenimiento = async (id_mantenimiento, { fecha, hora }) => {
     const result = await db.query(
         `
@@ -297,9 +295,9 @@ const iniciarMantenimiento = async (id_mantenimiento, { fecha, hora }) => {
 
 // estado → 3. El trigger cierra la ocupación tipo 2 y libera la cámara.
 //
-// fecha_fin y hora_fin son obligatorias aquí: el trigger las escribe en la
-// ocupación al cerrarla, y sin ellas el histórico queda sin la hora real de
-// liberación.
+// El controller siempre manda fecha y hora, calculadas en la zona de la
+// operación. El COALESCE queda como respaldo si alguien llama al método
+// sin ellas.
 const finalizarMantenimiento = async (id_mantenimiento, { fecha, hora }) => {
     const result = await db.query(
         `
@@ -315,10 +313,9 @@ const finalizarMantenimiento = async (id_mantenimiento, { fecha, hora }) => {
     return result.rows[0];
 };
 
-// estado → 4. SOLO desde 'programado' (1).
-//
-// ⚠️ El trigger no tiene rama para el 4: cancelar uno que esté en proceso
-// dejaría su ocupación tipo 2 activa para siempre. El controller lo impide.
+// estado → 4. El controller solo lo permite desde 'programado' (1): un
+// mantenimiento que llegó a bloquear la cámara se finaliza, no se cancela.
+// Aun así, desde la v2.4 el trigger libera la ocupación si la hubiera.
 const cancelarMantenimiento = async (id_mantenimiento) => {
     const result = await db.query(
         `
@@ -345,11 +342,12 @@ const deleteMantenimiento = async (id_mantenimiento) => {
 // Ocupaciones de bloqueo huérfanas — diagnóstico
 // ----------------------------------------------------------------------------
 // Ocupaciones tipo 2 que siguen activas aunque su mantenimiento ya no esté
-// en proceso. No deberían existir, pero el trigger no cubre el estado 4 y
-// una cancelación hecha directo en la BD las dejaría así.
+// en proceso.
 //
-// Es la consulta que explica por qué una cámara sigue bloqueada sin
-// mantenimiento visible.
+// Desde la v2.4 el trigger ya no las genera. Se conserva para lo que el
+// trigger no puede ver: ocupaciones tipo 2 creadas a mano sin mantenimiento
+// ligado (id_mantenimiento NULL, que el esquema permite) o restos de antes
+// de la migración.
 const getBloqueosHuerfanos = async (camaras = null) => {
     const result = await db.query(
         `
@@ -409,6 +407,9 @@ const cerrarBloqueo = async (id_ocupacion) => {
 // ----------------------------------------------------------------------------
 // Cuántas horas estuvo parada cada cámara y por qué. Es el insumo para
 // decidir si un equipo ya necesita reemplazo.
+//
+// Los cancelados no suman horas: nunca llegaron a bloquear (el controller
+// no permite cancelar uno en proceso).
 const getResumenPorCamara = async (
     { fecha_desde = null, fecha_hasta = null } = {},
     camaras = null
@@ -425,7 +426,7 @@ const getResumenPorCamara = async (
             COUNT(*) FILTER (WHERE m.tipo = 3)        AS emergencias,
             COUNT(*) FILTER (WHERE m.estado = 2)      AS en_proceso,
             ROUND(SUM(
-                CASE WHEN m.fecha_fin IS NOT NULL THEN
+                CASE WHEN m.fecha_fin IS NOT NULL AND m.estado = 3 THEN
                     EXTRACT(EPOCH FROM (
                         (m.fecha_fin + COALESCE(m.hora_fin, '00:00'::TIME))
                         - (m.fecha_inicio + m.hora_inicio)

@@ -1,5 +1,6 @@
 import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
+import { db } from "../database/connection.database.js";
 
 dotenv.config();
 
@@ -20,6 +21,26 @@ dotenv.config();
 //
 //   cargarAlcance (alcance.middleware.js) depende de estos dos primeros.
 //   Si se cambian de nombre, hay que ajustarlo allá también.
+//
+// ────────────────────────────────────────────────────────────────────────
+// CORRECCIÓN DE SEGURIDAD · LA SESIÓN SE VALIDA CONTRA LA BD
+// ────────────────────────────────────────────────────────────────────────
+//   Antes verifyToken solo revisaba la firma del token. Como el token dura
+//   12 horas, eso tenía dos consecuencias:
+//
+//     · Una cuenta DESHABILITADA seguía entrando hasta que vencía su token.
+//       Si era admin o coordinador, con acceso total: cargarAlcance les da
+//       camaras = null sin consultar nada. Un admin dado de baja podía
+//       incluso crear otra cuenta de admin, y esa sí sobrevivía a la baja.
+//
+//     · BAJAR DE ROL a alguien no surtía efecto hasta que vencía el token,
+//       porque el rol viajaba dentro del token.
+//
+//   Ahora cada petición consulta estado e id_role por llave primaria. Es la
+//   consulta más barata posible y cierra los dos huecos: la baja y el cambio
+//   de rol surten efecto en la siguiente petición.
+//
+//   El rol que manda es el de la BD, no el del token.
 // ============================================================================
 
 export const ROLES = {
@@ -34,7 +55,10 @@ export const ROLES = {
 // ----------------------------------------------------------------------------
 // Va SIEMPRE primero en la cadena de middlewares: los demás guards asumen
 // que req.id_role ya existe.
-export const verifyToken = (req, res, next) => {
+export const verifyToken = async (req, res, next) => {
+    // ---- 1) El token ----
+    let payload;
+
     try {
         const header = req.headers.authorization;
 
@@ -45,21 +69,7 @@ export const verifyToken = (req, res, next) => {
         }
 
         const token = header.split(" ")[1];
-        const payload = jwt.verify(token, process.env.JWT_SECRET);
-
-        // Se aceptan varias formas del campo de rol porque el login pudo
-        // firmarlo como 'role' o 'id_role' según la versión.
-        req.id_usuario = payload.id_usuario ?? payload.id ?? null;
-        req.id_role = Number(payload.id_role ?? payload.role ?? 0);
-        req.usuario = payload;
-
-        if (!req.id_usuario || !req.id_role) {
-            return res.status(401).json({
-                error: "El token no contiene los datos de sesión esperados"
-            });
-        }
-
-        next();
+        payload = jwt.verify(token, process.env.JWT_SECRET);
     } catch (error) {
         // Se distingue el vencimiento del token inválido: al frontend le
         // sirve para decidir si redirige al login o solo avisa.
@@ -69,7 +79,50 @@ export const verifyToken = (req, res, next) => {
                 expirado: true
             });
         }
+
         return res.status(401).json({ error: "Token inválido" });
+    }
+
+    // Se aceptan varias formas del campo porque el login pudo firmarlo con
+    // nombres distintos según la versión.
+    const idUsuario = payload.id_usuario ?? payload.id ?? null;
+
+    if (!idUsuario) {
+        return res.status(401).json({
+            error: "El token no contiene los datos de sesión esperados"
+        });
+    }
+
+    // ---- 2) La cuenta, contra la BD ----
+    // Va en su propio try: si la BD falla es un 500, no un "token inválido".
+    // Confundirlos mandaría al usuario al login por un problema de servidor.
+    try {
+        const result = await db.query(
+            `SELECT id_role, estado FROM usuarios WHERE id_usuario = $1`,
+            [idUsuario]
+        );
+
+        const cuenta = result.rows[0];
+
+        if (!cuenta || Number(cuenta.estado) !== 1) {
+            return res.status(401).json({
+                error: "Tu cuenta está deshabilitada o ya no existe",
+                deshabilitado: true
+            });
+        }
+
+        req.id_usuario = Number(idUsuario);
+        // El rol de la BD, no el del token: así un cambio de rol surte
+        // efecto de inmediato.
+        req.id_role = Number(cuenta.id_role);
+        req.usuario = { ...payload, id_role: req.id_role };
+
+        next();
+    } catch (error) {
+        console.error("Error al validar la sesión contra la BD:", error);
+        return res.status(500).json({
+            error: "No se pudo validar la sesión"
+        });
     }
 };
 
@@ -82,10 +135,12 @@ const guardDeRol = (nivelMinimo, etiqueta) => {
         if (!req.id_role) {
             return res.status(401).json({ error: "Sesión no válida" });
         }
+
         // Menor número = más privilegios. Admin (1) pasa todos los guards.
         if (req.id_role <= nivelMinimo) {
             return next();
         }
+
         return res.status(403).json({
             error: `Necesitas permisos de ${etiqueta} para esta acción`
         });
@@ -100,8 +155,9 @@ export const verifyOperativo   = guardDeRol(ROLES.OPERATIVO, "operativo");
 // ----------------------------------------------------------------------------
 // firmarToken — se usa en el login
 // ----------------------------------------------------------------------------
-// 12 horas cubre un turno completo con margen. Más tiempo sería cómodo pero
-// deja sesiones vivas en dispositivos compartidos de planta.
+// 12 horas cubre un turno completo con margen. Con la validación contra la
+// BD, la duración ya no es un riesgo de seguridad: deshabilitar la cuenta
+// corta el acceso aunque el token siga vigente.
 export const firmarToken = (usuario) => {
     return jwt.sign(
         {

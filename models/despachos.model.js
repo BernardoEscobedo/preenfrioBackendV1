@@ -12,40 +12,37 @@ import { db } from "../database/connection.database.js";
 //   (BEFORE INSERT), que genera el movimiento tipo 3. Es ESE movimiento —
 //   con su propio trigger — el que descuenta la cámara.
 //
-//   Este modelo NUNCA escribe en ocupaciones_camaras. Si lo hiciera,
-//   tendríamos doble descuento: el de aquí y el del movimiento.
+//   Quitar una línea borra ese movimiento, y trg_revertir_movimiento (v2.5)
+//   devuelve la fruta. Este modelo NUNCA escribe en ocupaciones_camaras.
 //
 // ⚠️ LOS TOTALES NO SE CAPTURAN
 //   despachos.cantidad_tarimas y cantidad_cajas los mantiene
-//   trg_recalcular_totales_despacho sumando el detalle. Por eso el INSERT y
-//   el UPDATE del encabezado no los tocan.
+//   trg_recalcular_totales_despacho sumando el detalle.
 //
 // ESTADOS
 //   1 = borrador  se puede editar, agregar líneas y eliminar
 //   2 = cerrado   ya salió; solo admite corrección auditada
 //
 //   NO existe "cancelado" a propósito: un despacho o salió o no salió.
-//   Marcarlo como cancelado sin revertir el inventario generaba descuadres
-//   silenciosos.
 //
 // ALCANCE POR CÁMARA
 //   El documento no tiene cámara — la tienen sus líneas. Un supervisor ve
 //   los despachos que llevan fruta de SUS cámaras, más los borradores
 //   vacíos (que todavía no tienen planta asignada).
+//
+// CORRECCIÓN DE LA AUDITORÍA
+//   getDisponibleParaPicking no tenía ORDER BY y confiaba en el orden de la
+//   vista. En PostgreSQL, en cuanto se aplica un WHERE sobre una vista, ese
+//   orden deja de estar garantizado: el picking podía dejar de mostrar
+//   primero lo crítico sin que nadie lo notara.
 // ============================================================================
 
 // ----------------------------------------------------------------------------
 // Listado — lee vw_despachos
 // ----------------------------------------------------------------------------
-// La vista ya resuelve cliente, CEDIS, transporte y los conteos de líneas,
-// fotos y ediciones.
-//
 // EL FILTRO DE ALCANCE ES POR EXISTENCIA DE LÍNEA
-//   Un despacho pertenece a quien puso la fruta. La condición tiene dos
-//   partes:
-//     · EXISTS  → alguna de sus líneas sale de una cámara del alcance
-//     · NOT EXISTS → es un borrador todavía sin líneas, así que no tiene
-//                    planta asignada y cualquiera puede continuarlo
+//   · EXISTS     → alguna de sus líneas sale de una cámara del alcance
+//   · NOT EXISTS → es un borrador todavía sin líneas
 const getDespachos = async (
     {
         estado = null,
@@ -101,8 +98,7 @@ const getDespachoById = async (id_despacho) => {
     return result.rows[0];
 };
 
-// El picking completo. Lee vw_despachos_detalle, que trae la trazabilidad
-// de cada línea: lote, finca, productor, SKU y cámara de origen.
+// El picking completo, con la trazabilidad de cada línea.
 const getDetalle = async (id_despacho) => {
     const result = await db.query(
         `
@@ -120,11 +116,9 @@ const getDetalle = async (id_despacho) => {
 // ----------------------------------------------------------------------------
 // El folio se genera en la BD con fn_generar_folio_despacho(), que consume
 // la secuencia seq_folio_despacho (numeración de negocio desde 70000).
+// Calcularlo con MAX(folio)+1 abriría una ventana de carrera.
 //
-// Generarlo aquí con un SELECT MAX(folio)+1 abriría una ventana de carrera:
-// dos despachos simultáneos tomarían el mismo número. La secuencia no.
-//
-// Nace en estado 1 (borrador): sin líneas todavía, el camión aún no carga.
+// Nace en estado 1 (borrador).
 const createDespacho = async ({
     id_transporte,
     fecha_despacho,
@@ -168,8 +162,8 @@ const createDespacho = async ({
 // ----------------------------------------------------------------------------
 // Edición del encabezado
 // ----------------------------------------------------------------------------
-// NO toca cantidad_tarimas ni cantidad_cajas: esos los deriva el trigger
-// desde el detalle. Tampoco el folio ni el estado, que tienen su propia vía.
+// NO toca cantidad_tarimas ni cantidad_cajas: los deriva el trigger.
+// Tampoco el folio ni el estado, que tienen su propia vía.
 const updateDespacho = async (
     id_despacho,
     {
@@ -216,8 +210,7 @@ const updateDespacho = async (
     return result.rows[0];
 };
 
-// Cerrar: el camión salió. A partir de aquí solo se admiten correcciones
-// administrativas auditadas.
+// Cerrar: el camión salió.
 const cerrarDespacho = async (id_despacho) => {
     const result = await db.query(
         `UPDATE despachos SET estado = 2 WHERE id_despacho = $1 RETURNING *`,
@@ -226,8 +219,7 @@ const cerrarDespacho = async (id_despacho) => {
     return result.rows[0];
 };
 
-// Reabrir a borrador. Solo admin, y siempre con auditoría: significa que el
-// documento se cerró por error.
+// Reabrir a borrador. Solo admin, y siempre con auditoría.
 const reabrirDespacho = async (id_despacho) => {
     const result = await db.query(
         `UPDATE despachos SET estado = 1 WHERE id_despacho = $1 RETURNING *`,
@@ -237,8 +229,7 @@ const reabrirDespacho = async (id_despacho) => {
 };
 
 // Eliminar el documento. Solo si está en borrador Y sin líneas: con líneas
-// habría que devolver la fruta a las cámaras, y para eso está
-// fn_quitar_linea_despacho.
+// hay que quitarlas primero para devolver la fruta a las cámaras.
 const deleteDespacho = async (id_despacho) => {
     const result = await db.query(
         `DELETE FROM despachos WHERE id_despacho = $1 RETURNING *`,
@@ -253,13 +244,6 @@ const deleteDespacho = async (id_despacho) => {
 // ⚠️ Este INSERT dispara trg_despacho_detalle_movimiento (BEFORE INSERT),
 // que crea el movimiento tipo 3 y escribe su id en NEW.id_movimiento. Ese
 // movimiento, a su vez, dispara el trigger que descuenta la cámara.
-//
-// Por eso aquí NO se toca ocupaciones_camaras: el descuento ya viene por
-// esa cadena. Tocarlo sería descontar dos veces.
-//
-// id_camara_origen e id_produccion se pueden omitir: el trigger los deduce
-// de la ocupación. Se mandan de todos modos porque el controller ya los
-// consultó para validar, y dejarlos explícitos hace el registro legible.
 const agregarLinea = async ({
     id_despacho,
     id_produccion,
@@ -299,18 +283,17 @@ const agregarLinea = async ({
 // ----------------------------------------------------------------------------
 // PICKING — quitar línea
 // ----------------------------------------------------------------------------
-// Llama a fn_quitar_linea_despacho, que hace la reversa completa en una
-// sola operación atómica:
-//   1. Devuelve tarimas y cajas a la ocupación de origen
-//   2. La reabre si se había cerrado al vaciarse
-//   3. Borra la línea del detalle
-//   4. Borra el movimiento tipo 3 asociado
+// Llama a fn_quitar_linea_despacho. Desde la v2.5 la función ya no devuelve
+// la fruta por su cuenta: verifica que el despacho siga en borrador, borra
+// la línea y borra el movimiento tipo 3. Ese borrado dispara
+// trg_revertir_movimiento, que devuelve la fruta a su ocupación de origen y
+// la reabre si se había cerrado.
 //
-// Es la única reversa real del sistema: a recepciones y movimientos les
-// falta, porque sus triggers son AFTER INSERT y no revierten al borrar.
+// Así hay una sola vía de reversa: si la función también devolviera la
+// fruta, la cámara recuperaría el doble.
 //
-// ⚠️ Devuelve TEXTO, no excepción: 'OK: ...' o el motivo del rechazo (por
-// ejemplo, que el despacho ya esté cerrado). El controller lo interpreta.
+// ⚠️ Devuelve TEXTO, no excepción: 'OK: ...' o el motivo del rechazo. El
+// controller lo interpreta.
 const quitarLinea = async (id_detalle) => {
     const result = await db.query(
         `SELECT fn_quitar_linea_despacho($1) AS resultado`,
@@ -330,15 +313,9 @@ const getLineaById = async (id_detalle) => {
 // ----------------------------------------------------------------------------
 // Coherencia del picking contra el documento
 // ----------------------------------------------------------------------------
-// Devuelve las líneas cuyo cliente NO coincide con el del despacho.
-//
-// El caso que detecta: subir al camión de Walmart fruta que estaba planeada
-// para Chedraui. El CEDIS la rechaza en el andén o se factura mal, y el
-// costo del error es el viaje completo.
-//
-// No se bloquea al agregar la línea porque la fruta SÍ se reasigna entre
-// clientes y bloquear volvería el sistema inusable — pero cerrar el
-// despacho sin revisarlo sería peor.
+// Líneas cuyo cliente NO coincide con el del despacho: subir al camión de
+// Walmart fruta planeada para Chedraui. El CEDIS la rechaza en el andén o
+// se factura mal.
 const getLineasDeOtroCliente = async (id_despacho) => {
     const result = await db.query(
         `
@@ -382,8 +359,7 @@ const getCamarasDelDespacho = async (id_despacho) => {
 // AUDITORÍA
 // ----------------------------------------------------------------------------
 // Un despacho cerrado no se elimina, pero sí admite corregir datos
-// administrativos: placas mal escritas, la orden de venta que llegó tarde.
-// Cada corrección exige motivo y queda registrada.
+// administrativos. Cada corrección exige motivo y queda registrada.
 const registrarAuditoria = async ({
     id_despacho,
     estado_al_editar,
@@ -419,15 +395,9 @@ const getAuditoria = async (id_despacho) => {
 // ----------------------------------------------------------------------------
 // Clientes con fruta disponible — dropdown del picking
 // ----------------------------------------------------------------------------
-// Evita ofrecer los 40 del catálogo cuando solo hay fruta para tres.
-//
-// ⚠️ Para usuarios con alcance limitado NO se usa vw_clientes_con_inventario
-// directo: esa vista agrega TODO el inventario, así que ofrecería clientes
-// cuya fruta está en otra planta. Se recalcula el agregado con el filtro
-// aplicado.
-//
-// v2.3: incluye nivel_criticidad, así el dropdown marca de una cuáles
-// clientes tienen fruta que ya no puede esperar.
+// ⚠️ No se usa vw_clientes_con_inventario directo: esa vista agrega TODO el
+// inventario y ofrecería clientes cuya fruta está en otra planta. Se
+// recalcula el agregado con el filtro de alcance aplicado.
 const getClientesConInventario = async (camaras = null) => {
     const result = await db.query(
         `
@@ -454,15 +424,19 @@ const getClientesConInventario = async (camaras = null) => {
     return result.rows;
 };
 
-// Fruta disponible para armar el picking de un cliente concreto.
-// Viene de vw_inventario_disponible, ordenada por criticidad y luego FEFO
-// (v2.3): lo que está más cerca de incumplir su cita aparece primero.
+// Fruta disponible para armar el picking.
+// Criticidad y luego FEFO (v2.3): lo que está más cerca de incumplir su cita
+// aparece primero. El ORDER BY va explícito: el de la vista deja de estar
+// garantizado en cuanto se aplica el WHERE.
 const getDisponibleParaPicking = async (id_cc, camaras = null) => {
     const result = await db.query(
         `
         SELECT * FROM vw_inventario_disponible
         WHERE ($1::INT IS NULL OR id_cc = $1)
           AND ($2::INT[] IS NULL OR id_camara = ANY($2))
+        ORDER BY nivel_criticidad ASC,
+                 fecha_empaque ASC NULLS LAST,
+                 id_ocupacion ASC
         `,
         [id_cc, camaras]
     );

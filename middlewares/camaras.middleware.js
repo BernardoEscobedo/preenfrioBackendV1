@@ -4,6 +4,10 @@
 // Las capacidades se validan con cuidado porque son el tope que usan los
 // triggers: si se captura 0 o un valor absurdo, el sistema mandará toda la
 // fruta a la cola o permitirá sobrellenar la cámara.
+//
+// CORRECCIÓN DE LA AUDITORÍA
+//   Las capacidades exigen enteros. Con 20.5, Postgres rechazaba el valor
+//   en la columna INT y se respondía 500 en vez de 400.
 // ============================================================================
 
 const TIPOS_VALIDOS = [1, 2]; // 1=preenfrío · 2=conservación
@@ -24,6 +28,7 @@ export const validarCamara = (req, res, next) => {
             error: 'El campo "nombre_camara" es obligatorio'
         });
     }
+
     if (nombre_camara.length > 60) {
         return res.status(400).json({
             error: 'El campo "nombre_camara" no puede exceder 60 caracteres'
@@ -43,6 +48,7 @@ export const validarCamara = (req, res, next) => {
             error: 'El campo "ubicacion" es obligatorio (ej. Finca Doña Nelly)'
         });
     }
+
     if (ubicacion.length > 60) {
         return res.status(400).json({
             error: 'El campo "ubicacion" no puede exceder 60 caracteres'
@@ -53,29 +59,32 @@ export const validarCamara = (req, res, next) => {
     // Tarimas es la que realmente gobierna: fn_tarimas_disponibles y los
     // triggers de cola trabajan con ella. Por eso debe ser mayor a cero.
     const tarimas = Number(capacidad_max_tarimas);
-    if (isNaN(tarimas) || tarimas <= 0) {
+
+    if (!Number.isInteger(tarimas) || tarimas <= 0) {
         return res.status(400).json({
-            error: 'El campo "capacidad_max_tarimas" debe ser un número mayor a 0'
+            error: 'El campo "capacidad_max_tarimas" debe ser un número entero mayor a 0'
         });
     }
 
     const cajas = Number(capacidad_max_cajas);
-    if (isNaN(cajas) || cajas < 0) {
+
+    if (!Number.isInteger(cajas) || cajas < 0) {
         return res.status(400).json({
-            error: 'El campo "capacidad_max_cajas" debe ser un número (>= 0)'
+            error: 'El campo "capacidad_max_cajas" debe ser un número entero (>= 0)'
         });
     }
 
     const bloques = Number(capacidad_max_bloques);
-    if (isNaN(bloques) || bloques < 0) {
+
+    if (!Number.isInteger(bloques) || bloques < 0) {
         return res.status(400).json({
-            error: 'El campo "capacidad_max_bloques" debe ser un número (>= 0)'
+            error: 'El campo "capacidad_max_bloques" debe ser un número entero (>= 0)'
         });
     }
 
-    // Aviso de coherencia: 48 cajas = 1 tarima (42 en plátano macho).
-    // Si las cajas no alcanzan ni para las tarimas declaradas, algo se
-    // capturó mal. No se bloquea porque hay cámaras con reglas especiales.
+    // Coherencia: 48 cajas = 1 tarima (42 en la familia CPL0813). Si las
+    // cajas no alcanzan ni para una por tarima, algo se capturó mal y se
+    // rechaza. El 0 sí se permite: significa "no se controla por cajas".
     if (cajas > 0 && cajas < tarimas) {
         return res.status(400).json({
             error: `Revisa las capacidades: ${cajas} cajas para ${tarimas} tarimas no es coherente (cada tarima lleva ~48 cajas)`
@@ -95,10 +104,12 @@ export const validarCamara = (req, res, next) => {
 
 export const validarIdCamara = (req, res, next) => {
     const { id_camara } = req.params;
+
     if (!id_camara || isNaN(Number(id_camara))) {
         return res.status(400).json({
             error: "El id de cámara debe ser un número válido"
         });
     }
+
     next();
 };

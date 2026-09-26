@@ -1,5 +1,6 @@
 import mantenimientosModel from "../models/mantenimientos.model.js";
 import camarasModel from "../models/camaras.model.js";
+import { aFechaISO, hoyISO } from "../utils/fechas.js";
 
 // ============================================================================
 // MANTENIMIENTOS DE CÁMARA
@@ -17,20 +18,45 @@ import camarasModel from "../models/camaras.model.js";
 //   propias advertencias: no debería poder dispararse por accidente al
 //   guardar un formulario.
 //
-// ⚠️ EL HUECO DEL TRIGGER: EL ESTADO 4
-//   trg_sync_ocupacion_mantenimiento solo tiene dos ramas:
-//     · estado → 2  crea la ocupación de bloqueo
-//     · estado → 3  la cierra
+// v2.4 · EL TRIGGER YA CUBRE LOS TRES CAMINOS
+//     estado → 2   bloquea la cámara
+//     estado → 3   la libera (finalizar)
+//     estado → 4   la libera (cancelar)  ← antes faltaba y la dejaba trabada
 //
-//   No hay rama para el 4 (cancelado). Si un mantenimiento pasa de 2 a 4,
-//   la ocupación tipo 2 queda ACTIVA para siempre y la cámara nunca vuelve
-//   a recibir fruta.
+// POR QUÉ SE SIGUE IMPIDIENDO CANCELAR UNO EN PROCESO
+//   Ya no es por seguridad de la BD: el trigger libera la cámara igual. Es
+//   por el DATO. Si la cámara estuvo parada, ese paro ocurrió y tiene que
+//   quedar en el histórico de horas de paro, que es el insumo para decidir
+//   cuándo reemplazar un equipo. "Cancelado" significa que nunca pasó.
 //
-//   Este controller lo impide: desde 'en proceso' solo se puede finalizar.
-//   Y para los casos que ya quedaron trabados —por una cancelación hecha
-//   directo en la BD, por ejemplo— están getBloqueosHuerfanos y
-//   cerrarBloqueo.
+// CORRECCIONES DE LA AUDITORÍA
+//   · Los mensajes ya no dicen que la cámara "quedaría bloqueada
+//     permanentemente": desde la v2.4 eso es falso.
+//   · Finalizar rechaza una fecha/hora de fin anterior al inicio. Antes se
+//     aceptaba y quedaban horas de paro negativas en el reporte.
+//   · Al finalizar, la fecha y hora de cierre se calculan aquí en la zona de
+//     la operación y se mandan explícitas a la BD. Así la validación y lo
+//     que se guarda son el mismo dato, sin depender de la zona horaria del
+//     servidor de base de datos.
 // ============================================================================
+
+const ZONA_OPERACION = "America/Mexico_City";
+
+/** Hora actual en la zona de operación, como 'HH:MM:SS'. */
+const horaActualISO = () =>
+    new Intl.DateTimeFormat("en-GB", {
+        timeZone: ZONA_OPERACION,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23"
+    }).format(new Date());
+
+/** Lleva una hora 'HH:MM' o 'HH:MM:SS' a 'HH:MM:SS' para compararla. */
+const normalizarHora = (hora) => {
+    const texto = String(hora ?? "00:00:00").slice(0, 8);
+    return texto.length === 5 ? `${texto}:00` : texto;
+};
 
 // GET /api/preenfrio/mantenimientos?estado=2&id_camara=1
 const getMantenimientos = async (req, res) => {
@@ -110,10 +136,11 @@ const getActivos = async (req, res) => {
 // GET /api/preenfrio/mantenimientos/bloqueos-huerfanos
 // ----------------------------------------------------------------------------
 // Ocupaciones tipo 2 activas cuyo mantenimiento ya no está en proceso.
-// No deberían existir, pero el trigger no cubre el estado 4 y una
-// cancelación hecha directo en la BD las dejaría así.
 //
-// Es la herramienta de diagnóstico para una cámara trabada.
+// Desde la v2.4 el trigger ya no las genera. Esta consulta se conserva como
+// diagnóstico para lo que el trigger no puede ver: ocupaciones tipo 2
+// creadas a mano sin mantenimiento ligado (id_mantenimiento NULL, que el
+// esquema permite) o restos de antes de la migración.
 const getBloqueosHuerfanos = async (req, res) => {
     try {
         const huerfanos = await mantenimientosModel.getBloqueosHuerfanos(
@@ -179,14 +206,15 @@ const createMantenimiento = async (req, res) => {
         }
 
         // ---- No puede haber dos bloqueos activos ----
-        // Dos ocupaciones tipo 2 sobre la misma cámara dejarían una
-        // huérfana al finalizar la primera, y la cámara seguiría trabada.
+        // El trigger v2.4 ya no crea un segundo bloqueo, pero el segundo
+        // mantenimiento quedaría "en proceso" sin ocupación propia: al
+        // finalizar el primero, la cámara se liberaría con otro paro abierto.
         if (Number(estado) === 2) {
             const activo = await mantenimientosModel.getActivoPorCamara(id_camara);
 
             if (activo) {
                 return res.status(409).json({
-                    error: `La cámara "${camara.nombre_camara}" ya tiene un mantenimiento en proceso desde el ${activo.fecha_inicio}: "${activo.motivo}". Finalízalo antes de iniciar otro.`
+                    error: `La cámara "${camara.nombre_camara}" ya tiene un mantenimiento en proceso desde el ${aFechaISO(activo.fecha_inicio)}: "${activo.motivo}". Finalízalo antes de iniciar otro.`
                 });
             }
         }
@@ -322,7 +350,8 @@ const iniciarMantenimiento = async (req, res) => {
             });
         }
 
-        // Dos bloqueos activos sobre la misma cámara dejarían uno huérfano
+        // Dos mantenimientos en proceso sobre la misma cámara dejarían uno
+        // sin ocupación de bloqueo propia
         const activo = await mantenimientosModel.getActivoPorCamara(
             existente.id_camara,
             Number(id)
@@ -379,7 +408,6 @@ const iniciarMantenimiento = async (req, res) => {
 const finalizarMantenimiento = async (req, res) => {
     try {
         const { id } = req.params;
-        const { fecha, hora } = req.body;
 
         const existente = await mantenimientosModel.getMantenimientoById(id);
 
@@ -402,7 +430,30 @@ const finalizarMantenimiento = async (req, res) => {
             });
         }
 
-        await mantenimientosModel.finalizarMantenimiento(id, { fecha, hora });
+        // ---- Fecha y hora de cierre ----
+        // Si no vienen, el momento actual en la zona de operación. Se mandan
+        // explícitas a la BD para que lo que se valida y lo que se guarda
+        // sean el mismo dato.
+        const fechaFin = req.body.fecha ?? hoyISO();
+        const horaFin = normalizarHora(req.body.hora ?? horaActualISO());
+
+        // ---- El fin no puede ser antes del inicio ----
+        // Antes se aceptaba y el reporte mostraba horas de paro negativas.
+        // Se compara como texto 'AAAA-MM-DDTHH:MM:SS', que ordena igual que
+        // la fecha.
+        const inicio = `${aFechaISO(existente.fecha_inicio)}T${normalizarHora(existente.hora_inicio)}`;
+        const fin = `${fechaFin}T${horaFin}`;
+
+        if (fin < inicio) {
+            return res.status(400).json({
+                error: `El cierre (${fechaFin} ${horaFin.slice(0, 5)}) no puede ser anterior al inicio del mantenimiento (${inicio.replace("T", " ").slice(0, 16)}).`
+            });
+        }
+
+        await mantenimientosModel.finalizarMantenimiento(id, {
+            fecha: fechaFin,
+            hora: horaFin
+        });
         const completo = await mantenimientosModel.getMantenimientoById(id);
 
         // Verificación: el trigger debió cerrar la ocupación de bloqueo.
@@ -430,11 +481,12 @@ const finalizarMantenimiento = async (req, res) => {
 // ----------------------------------------------------------------------------
 // DELETE /api/preenfrio/mantenimientos/:id  → cancelar
 // ----------------------------------------------------------------------------
-// estado 1 → 4. SOLO desde 'programado'.
+// estado 1 → 4. Solo desde 'programado'.
 //
-// ⚠️ Cancelar uno EN PROCESO dejaría su ocupación tipo 2 activa para
-// siempre: el trigger no tiene rama para el estado 4. Por eso se bloquea y
-// se obliga a finalizar, que sí libera la cámara.
+// Desde la v2.4 cancelar uno EN PROCESO ya no dejaría la cámara trabada: el
+// trigger la libera. Se sigue bloqueando por el dato: ese paro sí ocurrió y
+// tiene que quedar en el histórico de horas de paro. Para cerrarlo está
+// "finalizar".
 const cancelarMantenimiento = async (req, res) => {
     try {
         const { id } = req.params;
@@ -454,10 +506,9 @@ const cancelarMantenimiento = async (req, res) => {
             });
         }
 
-        // El bloqueo clave de este módulo
         if (Number(existente.estado) === 2) {
             return res.status(409).json({
-                error: `No se puede cancelar un mantenimiento EN PROCESO: la cámara "${existente.nombre_camara}" quedaría bloqueada permanentemente. Usa "finalizar" para liberarla.`
+                error: `No se puede cancelar un mantenimiento que ya está en proceso: la cámara "${existente.nombre_camara}" sí estuvo parada y ese paro debe quedar en el histórico. Usa "finalizar" para cerrarlo y liberar la cámara.`
             });
         }
 
@@ -491,9 +542,9 @@ const cancelarMantenimiento = async (req, res) => {
 // Salida de emergencia: cierra a mano una ocupación tipo 2 que quedó
 // trabada. Solo admin.
 //
-// Existe porque el trigger no cubre el estado 4: si alguien canceló un
-// mantenimiento en proceso directo en la BD, la cámara se queda bloqueada
-// sin forma de liberarla desde la aplicación.
+// Desde la v2.4 el trigger ya no genera bloqueos huérfanos. Esto queda para
+// lo que el trigger no puede ver: ocupaciones tipo 2 creadas a mano sin
+// mantenimiento ligado, o restos de antes de la migración.
 const liberarBloqueo = async (req, res) => {
     try {
         const { id_ocupacion } = req.params;

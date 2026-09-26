@@ -1,10 +1,12 @@
 import { Router } from "express";
 import { transportesController } from "../controllers/transportes.controller.js";
+import transportesModel from "../models/transportes.model.js";
 import {
     validarTransporte,
     validarInocuidad,
     validarIdTransporte
 } from "../middlewares/transportes.middleware.js";
+import { conservarCampos } from "../middlewares/conservar.middleware.js";
 import {
     verifyToken,
     verifyCoordinador,
@@ -48,7 +50,20 @@ router.get("/:id", verifyToken, verifyOperativo, validarIdTransporte, transporte
 // "15AN7H" y "15-AN-7H" son la misma placa.
 router.post("/", verifyToken, verifyCoordinador, validarTransporte, transportesController.createTransporte);
 
-router.put("/:id", verifyToken, verifyCoordinador, validarIdTransporte, validarTransporte, transportesController.updateTransporte);
+// ⚠️ conservarCampos va ANTES del validador, y aquí es crítico.
+// Como la inocuidad tiene su propio PATCH, lo normal es que el formulario
+// de edición NO la mande. Sin esto, el validador le ponía 1 por defecto:
+// editar el celular del operador APROBABA una unidad que el supervisor
+// había rechazado, y el bloqueo del cierre de despacho dejaba de protegerla.
+router.put(
+    "/:id",
+    verifyToken,
+    verifyCoordinador,
+    validarIdTransporte,
+    conservarCampos(transportesModel.getTransporteById, ["inocuidad", "estado"]),
+    validarTransporte,
+    transportesController.updateTransporte
+);
 
 // ---- Inspección sanitaria ----
 // Supervisor+: es quien revisa la caja en el andén.

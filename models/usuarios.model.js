@@ -19,6 +19,13 @@ import { db } from "../database/connection.database.js";
 // SOBRE EL HASH
 //   password_hash NUNCA se devuelve en las consultas de lectura. Solo el
 //   login lo trae (ver auth.model.js) para compararlo con bcrypt.
+//
+// v2.2 · ESTADO DE LA CUENTA
+//   1 = habilitada · 0 = deshabilitada. Deshabilitar en vez de borrar corta
+//   el acceso de inmediato sin perder la autoría de lo que esa cuenta
+//   registró. Desde la auditoría, verifyToken consulta esta columna en cada
+//   petición, así que el corte surte efecto al instante y no hasta que
+//   vence el token.
 // ============================================================================
 
 const SELECT_USUARIO = `
@@ -27,6 +34,12 @@ const SELECT_USUARIO = `
         u.usuario,
         u.id_role,
         r.tipo              AS rol,
+        u.estado,
+        CASE u.estado
+            WHEN 1 THEN 'Habilitada'
+            WHEN 0 THEN 'Deshabilitada'
+            ELSE 'Otro'
+        END                 AS estado_texto,
         u.id_empleado,
         e.nombre            AS nombre_empleado,
         e.apellidos         AS apellidos_empleado,
@@ -49,9 +62,12 @@ const SELECT_USUARIO = `
 // ---------------------------------------------------------
 // CONSULTAS
 // ---------------------------------------------------------
+
+// Las deshabilitadas salen al final: la lista sirve sobre todo para
+// administrar las cuentas que están en uso.
 const getUsuarios = async () => {
     const result = await db.query(
-        `${SELECT_USUARIO} ORDER BY u.id_role, u.usuario`
+        `${SELECT_USUARIO} ORDER BY u.estado DESC, u.id_role, u.usuario`
     );
     return result.rows;
 };
@@ -69,6 +85,8 @@ const getUsuarioById = async (id_usuario) => {
 // que reviente el índice UNIQUE.
 // Al editar se excluye el propio id, para que guardar sin cambiar el
 // nombre no marque conflicto consigo mismo.
+//
+// No filtra por estado: una cuenta deshabilitada sigue ocupando su nombre.
 const existeUsuario = async (usuario, id_excluir = null) => {
     const result = await db.query(
         `
@@ -81,9 +99,11 @@ const existeUsuario = async (usuario, id_excluir = null) => {
     return result.rows.length > 0;
 };
 
-// Supervisores y operativos sin zona de trabajo asignada.
-// Es el reporte que evita el clásico "el sistema no me carga nada":
-// sin cámaras vigentes, esos roles no ven absolutamente ningún dato.
+// Supervisores y operativos HABILITADOS sin zona de trabajo asignada.
+// Es el reporte que evita el clásico "el sistema no me carga nada": sin
+// cámaras vigentes, esos roles no ven absolutamente ningún dato.
+//
+// Las cuentas deshabilitadas se excluyen: no tiene caso asignarles zona.
 const getSinCamaras = async () => {
     const result = await db.query(
         `
@@ -96,6 +116,7 @@ const getSinCamaras = async () => {
         LEFT JOIN usuarios_camaras uc
                ON uc.id_usuario = u.id_usuario AND uc.fecha_fin IS NULL
         WHERE u.id_role IN (3, 4)
+          AND u.estado = 1
           AND uc.id_usuario IS NULL
         ORDER BY u.usuario
         `
@@ -103,34 +124,68 @@ const getSinCamaras = async () => {
     return result.rows;
 };
 
+// Administradores habilitados, sin contar al usuario indicado.
+// El controller lo usa para que nadie deje el sistema sin ningún admin
+// activo, ya sea deshabilitándolo o bajándole el rol.
+const contarAdminsActivos = async (id_excluir = null) => {
+    const result = await db.query(
+        `
+        SELECT COUNT(*)::INT AS total
+        FROM usuarios
+        WHERE id_role = 1
+          AND estado = 1
+          AND ($1::INT IS NULL OR id_usuario <> $1)
+        `,
+        [id_excluir]
+    );
+    return result.rows[0].total;
+};
+
 // ---------------------------------------------------------
 // ALTA Y EDICIÓN
 // ---------------------------------------------------------
+
 // El hash llega ya calculado desde el controller: bcrypt es asíncrono y
 // no tiene por qué vivir en la capa de datos.
+// Nace habilitada (DEFAULT 1 de la columna).
 const createUsuario = async ({ usuario, password_hash, id_empleado, id_role }) => {
     const result = await db.query(
         `
         INSERT INTO usuarios (usuario, password_hash, id_empleado, id_role)
         VALUES ($1, $2, $3, $4)
-        RETURNING id_usuario, usuario, id_empleado, id_role
+        RETURNING id_usuario, usuario, id_empleado, id_role, estado
         `,
         [usuario, password_hash, id_empleado, id_role]
     );
     return result.rows[0];
 };
 
-// Actualiza cuenta, empleado y rol. La contraseña tiene su propio método:
-// mezclarlas obligaría a reenviar el hash en cada edición.
+// Actualiza cuenta, empleado y rol. La contraseña y el estado tienen sus
+// propios métodos: mezclarlos obligaría a reenviarlos en cada edición.
 const updateUsuario = async (id_usuario, { usuario, id_empleado, id_role }) => {
     const result = await db.query(
         `
         UPDATE usuarios
         SET usuario = $1, id_empleado = $2, id_role = $3
         WHERE id_usuario = $4
-        RETURNING id_usuario, usuario, id_empleado, id_role
+        RETURNING id_usuario, usuario, id_empleado, id_role, estado
         `,
         [usuario, id_empleado, id_role, id_usuario]
+    );
+    return result.rows[0];
+};
+
+// Habilitar (1) o deshabilitar (0) una cuenta.
+// Con la validación contra la BD en verifyToken, el cambio surte efecto en
+// la siguiente petición del usuario, aunque su token siga vigente.
+const setEstado = async (id_usuario, estado) => {
+    const result = await db.query(
+        `
+        UPDATE usuarios SET estado = $1
+        WHERE id_usuario = $2
+        RETURNING id_usuario, usuario, id_role, estado
+        `,
+        [estado, id_usuario]
     );
     return result.rows[0];
 };
@@ -152,7 +207,8 @@ const resetPassword = async (id_usuario, password_hash) => {
 
 // Al borrar el usuario, usuarios_camaras se limpia sola (ON DELETE CASCADE).
 // Las recepciones y movimientos que registró conservan su id_usuario porque
-// esa FK no tiene cascade: el histórico no debe perderse.
+// esa FK no tiene cascade: el histórico no debe perderse. Por eso, si tiene
+// registros, el borrado falla y la vía correcta es deshabilitar.
 const deleteUsuario = async (id_usuario) => {
     const result = await db.query(
         `DELETE FROM usuarios WHERE id_usuario = $1 RETURNING id_usuario, usuario`,
@@ -233,6 +289,7 @@ const quitarCamara = async (id_usuario, id_camara) => {
 // usuario quedaría con una zona de trabajo inconsistente.
 const reemplazarZonaTrabajo = async (id_usuario, camaras = []) => {
     const client = await db.connect();
+
     try {
         await client.query("BEGIN");
 
@@ -276,6 +333,7 @@ const reemplazarZonaTrabajo = async (id_usuario, camaras = []) => {
 // ---------------------------------------------------------
 // ROLES (catálogo de solo lectura)
 // ---------------------------------------------------------
+
 const getRoles = async () => {
     const result = await db.query(`SELECT * FROM roles ORDER BY id_role`);
     return result.rows;
@@ -286,8 +344,10 @@ const usuariosModel = {
     getUsuarioById,
     existeUsuario,
     getSinCamaras,
+    contarAdminsActivos,
     createUsuario,
     updateUsuario,
+    setEstado,
     resetPassword,
     deleteUsuario,
     // zona de trabajo

@@ -1,9 +1,11 @@
 import { Router } from "express";
 import { productoresController } from "../controllers/productores.controller.js";
+import productoresModel from "../models/productores.model.js";
 import {
     validarProductor,
     validarIdProductor
 } from "../middlewares/productores.middleware.js";
+import { conservarCampos } from "../middlewares/conservar.middleware.js";
 import {
     verifyToken,
     verifyCoordinador,
@@ -31,7 +33,11 @@ const router = Router();
 // ============================================================================
 
 // ---- Consultas ----
-// Filtros opcionales: ?activo=1 · ?buscar=texto
+// Filtros opcionales: ?estado=1 · ?buscar=texto
+//
+// Ojo: el filtro es ?estado, no ?activo. Desde la v2.2 la columna se llama
+// estado; un ?activo=1 se ignora en silencio y devuelve también los dados
+// de baja.
 router.get("/", verifyToken, verifyOperativo, productoresController.getProductores);
 
 router.get("/:id", verifyToken, verifyOperativo, validarIdProductor, productoresController.getProductorById);
@@ -40,10 +46,22 @@ router.get("/:id", verifyToken, verifyOperativo, validarIdProductor, productores
 // El controller valida que el código no esté duplicado antes de insertar
 router.post("/", verifyToken, verifyCoordinador, validarProductor, productoresController.createProductor);
 
-router.put("/:id", verifyToken, verifyCoordinador, validarIdProductor, validarProductor, productoresController.updateProductor);
+// conservarCampos va ANTES del validador: si el formulario no manda
+// 'estado', se conserva el actual en vez de reactivar al productor.
+// El alias { activo: "estado" } respeta a los clientes viejos que todavía
+// mandan 'activo'.
+router.put(
+    "/:id",
+    verifyToken,
+    verifyCoordinador,
+    validarIdProductor,
+    conservarCampos(productoresModel.getProductorById, ["estado"], { activo: "estado" }),
+    validarProductor,
+    productoresController.updateProductor
+);
 
 // ---- Baja ----
-// Lógica (activo = 0), no física: fincas y produccion referencian esta tabla
+// Lógica (estado = 0), no física: fincas y produccion referencian esta tabla
 router.delete("/:id", verifyToken, verifyCoordinador, validarIdProductor, productoresController.bajaProductor);
 
 router.patch("/:id/reactivar", verifyToken, verifyCoordinador, validarIdProductor, productoresController.reactivarProductor);

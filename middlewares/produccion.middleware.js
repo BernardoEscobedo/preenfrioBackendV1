@@ -1,3 +1,5 @@
+import { aFechaISO, semanaISO } from "../utils/fechas.js";
+
 // ============================================================================
 // VALIDACIONES DE PRODUCCIÓN
 // ============================================================================
@@ -16,20 +18,21 @@
 // POR QUÉ NO SE VALIDA 'estado'
 //   No entra por el body. Lo mantiene el trigger de la BD según lo recibido
 //   y la cancelación tiene su propio endpoint.
+//
+// CORRECCIONES DE LA AUDITORÍA
+//   · semanaISO vive ahora en utils/fechas.js y trabaja todo en UTC. La
+//     versión anterior mezclaba hora local con una fecha parseada en UTC y
+//     los lunes calculaba la semana anterior.
+//   · Las fechas se comparan como texto 'AAAA-MM-DD', no como Date.
+//   · Cajas, tarimas y tránsito exigen enteros: con 2.5, Postgres rechazaba
+//     el valor en la columna INT y se respondía 500 en vez de 400.
+//   · En el PUT, los campos opcionales ya llegan con su valor actual gracias
+//     a conservarCampos (ver produccion.route.js). Los defaults de aquí solo
+//     aplican de verdad en el alta.
 // ============================================================================
 
-/** Número de semana ISO de una fecha. Réplica de lo que usa logística. */
-const semanaISO = (fecha) => {
-    const d = new Date(Date.UTC(
-        fecha.getFullYear(),
-        fecha.getMonth(),
-        fecha.getDate()
-    ));
-    // Jueves de la semana en curso: define a qué año ISO pertenece
-    d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
-    const inicioAnio = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-    return Math.ceil((((d - inicioAnio) / 86400000) + 1) / 7);
-};
+/** true si el valor es un entero >= 0 */
+const esEnteroNoNegativo = (n) => Number.isInteger(n) && n >= 0;
 
 export const validarProduccion = (req, res, next) => {
     const {
@@ -58,9 +61,9 @@ export const validarProduccion = (req, res, next) => {
 
     const semanaNum = Number(semana);
 
-    if (semanaNum < 1 || semanaNum > 53) {
+    if (!Number.isInteger(semanaNum) || semanaNum < 1 || semanaNum > 53) {
         return res.status(400).json({
-            error: 'El campo "semana" debe estar entre 1 y 53'
+            error: 'El campo "semana" debe ser un entero entre 1 y 53'
         });
     }
 
@@ -73,9 +76,9 @@ export const validarProduccion = (req, res, next) => {
         });
     }
 
-    const fechaEmpaque = new Date(fecha_empaque);
+    const fechaEmpaque = aFechaISO(fecha_empaque);
 
-    if (isNaN(fechaEmpaque.getTime())) {
+    if (!fechaEmpaque) {
         return res.status(400).json({
             error: 'El campo "fecha_empaque" no es una fecha válida (usa AAAA-MM-DD)'
         });
@@ -86,10 +89,10 @@ export const validarProduccion = (req, res, next) => {
     const semanaCalculada = semanaISO(fechaEmpaque);
     const diferencia = Math.abs(semanaCalculada - semanaNum);
 
-    // El 52 cubre el salto de fin de año (semana 52 vs semana 1)
+    // El 51 cubre el salto de fin de año (semana 52 o 53 contra semana 1)
     if (diferencia > 1 && diferencia < 51) {
         return res.status(400).json({
-            error: `La semana ${semanaNum} no corresponde a la fecha de empaque ${fecha_empaque} (es semana ${semanaCalculada}). Revisa cuál de los dos está mal: ambos forman parte del código de lote.`
+            error: `La semana ${semanaNum} no corresponde a la fecha de empaque ${fechaEmpaque} (es semana ${semanaCalculada}). Revisa cuál de los dos está mal: ambos forman parte del código de lote.`
         });
     }
 
@@ -128,9 +131,9 @@ export const validarProduccion = (req, res, next) => {
         ? 0
         : Number(cajas_procesadas);
 
-    if (isNaN(cajas) || cajas < 0) {
+    if (!esEnteroNoNegativo(cajas)) {
         return res.status(400).json({
-            error: 'El campo "cajas_procesadas" debe ser un número mayor o igual a 0'
+            error: 'El campo "cajas_procesadas" debe ser un número entero mayor o igual a 0'
         });
     }
 
@@ -138,9 +141,9 @@ export const validarProduccion = (req, res, next) => {
         ? 0
         : Number(estiba_pallets);
 
-    if (isNaN(tarimas) || tarimas < 0) {
+    if (!esEnteroNoNegativo(tarimas)) {
         return res.status(400).json({
-            error: 'El campo "estiba_pallets" debe ser un número mayor o igual a 0'
+            error: 'El campo "estiba_pallets" debe ser un número entero mayor o igual a 0'
         });
     }
 
@@ -174,9 +177,9 @@ export const validarProduccion = (req, res, next) => {
     if (transito !== undefined && transito !== null && transito !== "") {
         transitoNum = Number(transito);
 
-        if (isNaN(transitoNum) || transitoNum < 0) {
+        if (!esEnteroNoNegativo(transitoNum)) {
             return res.status(400).json({
-                error: 'El campo "transito" debe ser un número de días mayor o igual a 0'
+                error: 'El campo "transito" debe ser un número entero de días mayor o igual a 0'
             });
         }
 
@@ -193,22 +196,21 @@ export const validarProduccion = (req, res, next) => {
     let fechaEntregaNorm = null;
 
     if (fecha_entrega) {
-        const fechaEntrega = new Date(fecha_entrega);
+        fechaEntregaNorm = aFechaISO(fecha_entrega);
 
-        if (isNaN(fechaEntrega.getTime())) {
+        if (!fechaEntregaNorm) {
             return res.status(400).json({
                 error: 'El campo "fecha_entrega" no es una fecha válida (usa AAAA-MM-DD)'
             });
         }
 
         // Entregar antes de empacar es imposible: es un error de captura.
-        if (fechaEntrega < fechaEmpaque) {
+        // La comparación es de texto: 'AAAA-MM-DD' ordena igual que la fecha.
+        if (fechaEntregaNorm < fechaEmpaque) {
             return res.status(400).json({
                 error: "La fecha de entrega no puede ser anterior a la fecha de empaque"
             });
         }
-
-        fechaEntregaNorm = fecha_entrega;
     }
 
     // ---- Campos de texto ----
@@ -226,6 +228,7 @@ export const validarProduccion = (req, res, next) => {
 
     // ---- Normalización ----
     req.body.semana = semanaNum;
+    req.body.fecha_empaque = fechaEmpaque;
     req.body.region = region ? String(region).trim().toUpperCase() : null;
     req.body.id_finca = Number(id_finca);
     req.body.id_productor = Number(id_productor);

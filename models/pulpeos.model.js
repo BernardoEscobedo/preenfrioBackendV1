@@ -1,4 +1,5 @@
 import { db } from "../database/connection.database.js";
+import { SQL_CAMARAS_REALES } from "../utils/camarasReales.sql.js";
 
 // ============================================================================
 // PULPEOS — CONTROL DE TEMPERATURA
@@ -14,21 +15,37 @@ import { db } from "../database/connection.database.js";
 //                      venir a distinta temperatura
 //   pulpeos_evidencia  la foto del termómetro
 //
-// POR QUÉ SE MIDE POR BLOQUE Y NO POR PROCESO
-//   El termómetro entra al montón físico. Si el bloque mezcla tres lotes,
-//   el operador pincha varias tarimas y registra el promedio en 'pulpeos';
-//   el desglose por lote va en el detalle cuando hace falta distinguir.
-//
 // EL DATO QUE DECIDE LA SALIDA
 //   temperatura_promedio contra temperatura_objetivo. Mientras no llegue al
-//   objetivo, la fruta sigue en preenfrío. Por eso este módulo es el que
-//   respalda la decisión de trasladar a conservación (bloque 8).
+//   objetivo, la fruta sigue en preenfrío.
 //
 // LA BAJA ES LÓGICA (v2.2)
-//   estado = 0 para una lectura errónea (termómetro descalibrado, tarima
-//   equivocada). No se borra: dejaría un hueco inexplicable en la secuencia
-//   de pulpeos del bloque, y esa secuencia es evidencia.
+//   estado = 0 para una lectura errónea. No se borra: dejaría un hueco
+//   inexplicable en la secuencia de pulpeos del bloque, y esa secuencia es
+//   evidencia.
+//
+// CORRECCIÓN DE LA AUDITORÍA · ALCANCE POR CÁMARA REAL
+//   El listado y los pendientes filtraban por produccion.id_camara, la
+//   cámara del plan. Si el camión se desvió en el andén, el supervisor de
+//   la cámara donde estaba la fruta no veía sus pulpeos pendientes. Ahora
+//   se usa SQL_CAMARAS_REALES, el mismo criterio que bloques.model.
 // ============================================================================
+
+// Condición de alcance reutilizable: el bloque tiene fruta en alguna de las
+// cámaras del usuario. Recibe el alias del bloque y el número de parámetro.
+const ALCANCE_BLOQUE = (aliasBloque, param) => `
+    (
+        ${param}::INT[] IS NULL
+        OR EXISTS (
+            SELECT 1
+            FROM bloques_produccion_detalle d
+            JOIN produccion pr ON pr.id_produccion = d.id_produccion
+            CROSS JOIN LATERAL (${SQL_CAMARAS_REALES("pr")}) AS cr(id_camara)
+            WHERE d.id_bloque = ${aliasBloque}.id_bloque
+              AND cr.id_camara = ANY(${param})
+        )
+    )
+`;
 
 const SELECT_PULPEO = `
     SELECT
@@ -66,8 +83,6 @@ const SELECT_PULPEO = `
 // ----------------------------------------------------------------------------
 // Listado
 // ----------------------------------------------------------------------------
-// El alcance se resuelve por las cámaras donde está la fruta del bloque,
-// igual que en el módulo de bloques.
 const getPulpeos = async (
     {
         id_bloque = null,
@@ -87,16 +102,7 @@ const getPulpeos = async (
           AND ($4::DATE IS NULL OR p.fecha_hora::DATE <= $4)
           AND ($5::BOOLEAN IS FALSE
                OR p.temperatura_promedio > p.temperatura_objetivo)
-          AND (
-              $6::INT[] IS NULL
-              OR EXISTS (
-                  SELECT 1
-                  FROM bloques_produccion_detalle d
-                  JOIN produccion pr ON pr.id_produccion = d.id_produccion
-                  WHERE d.id_bloque = p.id_bloque
-                    AND pr.id_camara = ANY($6)
-              )
-          )
+          AND ${ALCANCE_BLOQUE("p", "$6")}
         ORDER BY p.fecha_hora DESC, p.id_pulpeo DESC
         LIMIT 500
         `,
@@ -163,8 +169,6 @@ const getDetalle = async (id_pulpeo) => {
 // El pulpeo y su desglose se guardan juntos o no se guardan: un pulpeo sin
 // detalle cuando el bloque mezcla lotes es una medición que no se puede
 // atribuir, y un detalle huérfano no significa nada.
-//
-// Es el mismo patrón de reemplazarZonaTrabajo en usuarios.model.js.
 const createPulpeo = async ({
     id_bloque,
     fecha_hora,
@@ -242,7 +246,8 @@ const updatePulpeo = async (id_pulpeo, { numero_pulpeo, observaciones }) => {
     const result = await db.query(
         `
         UPDATE pulpeos
-        SET numero_pulpeo = $2, observaciones = $3
+        SET numero_pulpeo = COALESCE($2, numero_pulpeo),
+            observaciones = $3
         WHERE id_pulpeo = $1
         RETURNING *
         `,
@@ -304,7 +309,7 @@ const getCurva = async (id_bloque) => {
                 1
             ) AS horas_desde_armado,
             -- Cuánto bajó respecto a la medición anterior. LAG mira la fila
-            -- previa de la misma partición sin necesidad de un self-join.
+            -- previa sin necesidad de un self-join.
             ROUND(
                 p.temperatura_promedio - LAG(p.temperatura_promedio)
                     OVER (ORDER BY p.fecha_hora),
@@ -356,7 +361,7 @@ const getPendientes = async (horas_sin_pulpeo = 4, camaras = null) => {
             END AS situacion
         FROM bloques_fruta b
         LEFT JOIN LATERAL (
-            -- LATERAL permite traer la última fila por bloque sin subconsulta
+            -- LATERAL trae la última fila por bloque sin una subconsulta
             -- correlacionada por cada columna
             SELECT p.id_pulpeo, p.fecha_hora,
                    p.temperatura_promedio, p.temperatura_objetivo
@@ -372,16 +377,7 @@ const getPendientes = async (horas_sin_pulpeo = 4, camaras = null) => {
               OR EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - ult.fecha_hora)) / 3600
                  >= $1
           )
-          AND (
-              $2::INT[] IS NULL
-              OR EXISTS (
-                  SELECT 1
-                  FROM bloques_produccion_detalle d
-                  JOIN produccion pr ON pr.id_produccion = d.id_produccion
-                  WHERE d.id_bloque = b.id_bloque
-                    AND pr.id_camara = ANY($2)
-              )
-          )
+          AND ${ALCANCE_BLOQUE("b", "$2")}
         ORDER BY horas_desde_armado DESC
         `,
         [horas_sin_pulpeo, camaras]

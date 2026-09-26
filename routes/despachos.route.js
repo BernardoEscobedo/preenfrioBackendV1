@@ -33,26 +33,25 @@ const router = Router();
 //                  → trg_sync_ocupacion_movimiento descuenta la cámara
 //                  → trg_recalcular_totales_despacho actualiza los totales
 //
-//   El backend NUNCA toca ocupaciones_camaras: una sola vía de descuento.
+//   Quitar línea   → fn_quitar_linea_despacho borra la línea y su
+//                    movimiento
+//                  → trg_revertir_movimiento (v2.5) devuelve la fruta y
+//                    reabre la ocupación
 //
-//   Quitar línea   → fn_quitar_linea_despacho devuelve la fruta, reabre la
-//                    ocupación y borra el movimiento, todo atómico.
-//                    Es la única reversa completa del sistema.
+//   El backend NUNCA toca ocupaciones_camaras: una sola vía de descuento y
+//   una sola vía de reversa, las dos en la BD.
 //
 // ---- POR QUÉ ARMAR EL PICKING ES OPERATIVO ----
 //   Es trabajo de andén: el montacarguista sube tarimas y las va
-//   registrando. Si exigiera un rol superior, se anotaría en papel y se
-//   capturaría después — con los errores que eso arrastra.
-//
-//   El riesgo está acotado: no puede subir más de lo que hay en la cámara
-//   (el controller lo valida) ni tocar cámaras fuera de su alcance.
+//   registrando. El riesgo está acotado: no puede subir más de lo que hay
+//   en la cámara ni tocar cámaras fuera de su alcance.
 //
 // ---- POR QUÉ CERRAR ES SUPERVISOR ----
-//   Cerrar es declarar que el camión salió. A partir de ahí, corregir
-//   cuesta auditoría. Es el punto donde se aplican los bloqueos duros:
+//   Cerrar es declarar que el camión salió. Es el punto donde se aplican los
+//   bloqueos duros:
 //     · sin líneas de picking        → no se cierra
 //     · transporte con inocuidad 0   → no se cierra
-//     · fruta de otro cliente        → exige confirmación explícita
+//     · fruta de otro cliente        → exige ?confirmar=1 y queda auditado
 //
 // ---- POR QUÉ REABRIR ES ADMIN ----
 //   Significa que el documento se cerró por error. Siempre con motivo y
@@ -60,24 +59,19 @@ const router = Router();
 //
 // ---- EL ALCANCE SOBRE UN DOCUMENTO SIN CÁMARA ----
 //   El despacho no tiene cámara: la tienen sus líneas. Un despacho armado
-//   pertenece a quien puso la fruta; uno vacío todavía no tiene planta
-//   asignada, así que cualquiera puede continuarlo.
-//
-//   No se usa validarCamaraEnAlcance porque ninguna acción recibe un
-//   id_camara en el body: siempre se deduce de la ocupación de origen.
+//   pertenece a quien puso la fruta; uno vacío lo puede continuar
+//   cualquiera. No se usa validarCamaraEnAlcance porque ninguna acción
+//   recibe un id_camara en el body: siempre se deduce de la ocupación.
 // ============================================================================
 
 // ---- Consultas ----
 // Las rutas con prefijo fijo van ANTES de "/:id".
 
-// Dropdown del picking: solo clientes que REALMENTE tienen fruta en las
-// cámaras del alcance. No usa vw_clientes_con_inventario directo porque esa
-// vista agrega TODO el inventario y ofrecería clientes de otra planta.
-// v2.3: ordenados por criticidad.
+// Dropdown del picking: solo clientes con fruta en las cámaras del alcance,
+// ordenados por criticidad.
 router.get("/clientes-disponibles", verifyToken, verifyOperativo, cargarAlcance, despachosController.getClientesDisponibles);
 
-// Listado. Lee vw_despachos, que ya trae cliente, transporte y los conteos
-// de líneas, fotos y ediciones.
+// Listado. Lee vw_despachos.
 //   ?estado=1   ?id_cc=3   ?id_transporte=2
 //   ?fecha_desde=...   ?fecha_hasta=...
 //   ?buscar=texto   folio, cliente, orden de venta, cita o placas
@@ -87,8 +81,7 @@ router.get("/", verifyToken, verifyOperativo, cargarAlcance, despachosController
 // cliente no coincide con el del despacho.
 router.get("/:id", verifyToken, verifyOperativo, cargarAlcance, validarIdDespacho, despachosController.getDespachoById);
 
-// Fruta que se puede subir a este despacho. Por defecto solo la del cliente
-// del documento.
+// Fruta que se puede subir a este despacho, ordenada por criticidad y FEFO.
 //   ?todos=1 → incluye fruta de otros clientes, marcada con
 //              es_de_otro_cliente para que no pase inadvertida
 router.get("/:id/disponible", verifyToken, verifyOperativo, cargarAlcance, validarIdDespacho, despachosController.getDisponible);
@@ -132,13 +125,10 @@ router.post(
     despachosController.agregarLinea
 );
 
-// Quitar una línea: fn_quitar_linea_despacho devuelve la fruta a su cámara,
-// reabre la ocupación si se había cerrado y borra el movimiento.
+// Quitar una línea: la fruta regresa a su cámara vía trg_revertir_movimiento.
 //
-// ⚠️ La función devuelve TEXTO, no excepción. El controller lee el prefijo
-// 'OK:' para decidir entre 200 y 409: sin eso, intentar quitar una línea de
-// un despacho cerrado respondería 200 y el operador creería que la fruta
-// volvió a la cámara.
+// ⚠️ fn_quitar_linea_despacho devuelve TEXTO, no excepción. El controller
+// lee el prefijo 'OK:' para decidir entre 200 y 409.
 router.delete(
     "/:id/lineas/:id_detalle",
     verifyToken,
@@ -150,8 +140,6 @@ router.delete(
 );
 
 // ---- Cierre ----
-// Bloquea si no hay líneas, si el transporte tiene inocuidad rechazada, o
-// si lleva fruta de otro cliente sin confirmar (?confirmar=1).
 router.patch("/:id/cerrar", verifyToken, verifySupervisor, cargarAlcance, validarIdDespacho, despachosController.cerrarDespacho);
 
 // Reabrir a borrador. Solo admin, siempre con motivo, siempre auditado.
@@ -166,8 +154,7 @@ router.patch(
 );
 
 // ---- Eliminar ----
-// Solo borradores SIN líneas. Con fruta cargada hay que quitar cada línea
-// para devolverla a su cámara.
+// Solo borradores SIN líneas.
 router.delete("/:id", verifyToken, verifyAdmin, cargarAlcance, validarIdDespacho, despachosController.deleteDespacho);
 
 export default router;
