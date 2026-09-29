@@ -4,23 +4,15 @@ import usuariosModel from "../models/usuarios.model.js";
 // ============================================================================
 // USUARIOS
 // ============================================================================
-// Módulo reservado al administrador: crear cuentas implica repartir accesos
-// y definir qué cámaras ve cada quien.
+// Módulo reservado al administrador.
 //
-// La ZONA DE TRABAJO (cámaras asignadas) se administra con endpoints
-// propios, no al crear/editar el usuario. Ver § Zona de trabajo.
+// DESHABILITAR ES LA VÍA NORMAL DE BAJA
+//   Corta el acceso en la siguiente petición (verifyToken valida contra la
+//   BD) y conserva la autoría de todo lo que la cuenta registró.
 //
-// AUDITORÍA · DESHABILITAR CUENTAS
-//   Hasta ahora la única forma de quitarle el acceso a alguien era
-//   borrarlo, y eso fallaba en cuanto tuviera registros (la FK protege el
-//   histórico). Poner estado = 0 exigía entrar a la BD.
-//
-//   Ahora hay dos endpoints: deshabilitar y habilitar. Junto con la
-//   validación contra la BD en verifyToken, el corte surte efecto en la
-//   siguiente petición del usuario, aunque su token siga vigente.
-//
-//   Se protege un caso: nadie puede dejar el sistema sin ningún
-//   administrador activo, ni deshabilitándolo ni bajándole el rol.
+// v3.0 · HISTORIAL
+//   Deshabilitar exige motivo; habilitar lo acepta opcional. Los dos
+//   quedan en historial_estados (GET /bajas/historial) con quién y cuándo.
 // ============================================================================
 
 const SALT_ROUNDS = 10;
@@ -29,7 +21,6 @@ const SALT_ROUNDS = 10;
 // CONSULTAS
 // ---------------------------------------------------------
 
-// GET /api/preenfrio/usuarios/usuarios
 const getUsuarios = async (req, res) => {
     try {
         const usuarios = await usuariosModel.getUsuarios();
@@ -40,11 +31,9 @@ const getUsuarios = async (req, res) => {
     }
 };
 
-// GET /api/preenfrio/usuarios/usuario/:id
 const getUsuarioById = async (req, res) => {
     try {
-        const { id } = req.params;
-        const usuario = await usuariosModel.getUsuarioById(id);
+        const usuario = await usuariosModel.getUsuarioById(req.params.id);
 
         if (!usuario) {
             return res.status(404).json({ error: "Usuario no encontrado" });
@@ -57,7 +46,6 @@ const getUsuarioById = async (req, res) => {
     }
 };
 
-// GET /api/preenfrio/usuarios/roles
 const getRoles = async (req, res) => {
     try {
         const roles = await usuariosModel.getRoles();
@@ -68,9 +56,6 @@ const getRoles = async (req, res) => {
     }
 };
 
-// GET /api/preenfrio/usuarios/sincamaras
-// Supervisores y operativos habilitados sin zona de trabajo: no ven ningún
-// dato. Conviene revisarlo después de dar de alta personal.
 const getSinCamaras = async (req, res) => {
     try {
         const usuarios = await usuariosModel.getSinCamaras();
@@ -85,16 +70,27 @@ const getSinCamaras = async (req, res) => {
 // ALTA Y EDICIÓN
 // ---------------------------------------------------------
 
-// POST /api/preenfrio/usuarios/registrarusuario
 const createUsuario = async (req, res) => {
     try {
         const { usuario, password, id_empleado, id_role } = req.body;
 
-        // Se valida antes de insertar para dar un mensaje claro en vez de
-        // dejar que reviente el índice UNIQUE.
         if (await usuariosModel.existeUsuario(usuario)) {
             return res.status(409).json({
                 error: `El usuario "${usuario}" ya existe`
+            });
+        }
+
+        const empleado = await usuariosModel.getEstadoEmpleado(Number(id_empleado));
+
+        if (!empleado) {
+            return res.status(409).json({ error: "El empleado indicado no existe" });
+        }
+
+        // Una cuenta nueva para alguien dado de baja sería un acceso abierto
+        // para quien ya no trabaja aquí.
+        if (Number(empleado.estado) === 0) {
+            return res.status(409).json({
+                error: `${empleado.nombre} ${empleado.apellidos} está dado de baja. Reactívalo primero en el módulo de bajas.`
             });
         }
 
@@ -107,19 +103,15 @@ const createUsuario = async (req, res) => {
             id_role: Number(id_role)
         });
 
-        // Se devuelve el registro completo (con rol y nombre del empleado)
-        // para que el frontend no tenga que recargar la lista.
         const completo = await usuariosModel.getUsuarioById(nuevo.id_usuario);
 
-        // Aviso útil: los roles 3 y 4 sin cámaras no verán nada.
-        const necesitaZona = [3, 4].includes(Number(id_role));
+        const avisos = [];
 
-        res.status(201).json({
-            usuario: completo,
-            aviso: necesitaZona
-                ? "Asigna su zona de trabajo: sin cámaras asignadas no verá ningún dato."
-                : null
-        });
+        if ([3, 4].includes(Number(id_role))) {
+            avisos.push("Asigna su zona de trabajo: sin cámaras asignadas no verá ningún dato.");
+        }
+
+        res.status(201).json({ usuario: completo, avisos });
     } catch (error) {
         console.error("Error al crear usuario:", error);
 
@@ -133,16 +125,10 @@ const createUsuario = async (req, res) => {
             });
         }
 
-        res.status(500).json({
-            error: "Error al crear el usuario" +
-                (error.message ? `: ${error.message}` : "")
-        });
+        res.status(500).json({ error: "Error al crear el usuario" });
     }
 };
 
-// PUT /api/preenfrio/usuarios/actualizarusuario/:id
-// No toca la contraseña, el estado ni la zona de trabajo: cada uno tiene su
-// endpoint.
 const updateUsuario = async (req, res) => {
     try {
         const { id } = req.params;
@@ -154,16 +140,12 @@ const updateUsuario = async (req, res) => {
             return res.status(404).json({ error: "Usuario no encontrado" });
         }
 
-        // Se excluye el propio id: guardar sin cambiar el nombre no debe
-        // marcar conflicto consigo mismo.
         if (await usuariosModel.existeUsuario(usuario, Number(id))) {
             return res.status(409).json({
                 error: `El usuario "${usuario}" ya está en uso por otra cuenta`
             });
         }
 
-        // Bajarle el rol al último admin activo dejaría el sistema sin
-        // nadie que pueda administrar cuentas.
         const dejaDeSerAdmin =
             Number(existente.id_role) === 1 && Number(id_role) !== 1;
 
@@ -177,20 +159,13 @@ const updateUsuario = async (req, res) => {
             }
         }
 
-        const actualizado = await usuariosModel.updateUsuario(id, {
+        await usuariosModel.updateUsuario(id, {
             usuario,
             id_empleado: Number(id_empleado),
             id_role: Number(id_role)
         });
 
-        if (!actualizado) {
-            return res.status(404).json({ error: "Usuario no encontrado" });
-        }
-
         const completo = await usuariosModel.getUsuarioById(id);
-
-        // Con la validación contra la BD, el nuevo rol aplica en la
-        // siguiente petición: ya no hay que esperar a que venza el token.
         const cambioRol = Number(existente.id_role) !== Number(id_role);
 
         res.status(200).json({
@@ -216,16 +191,11 @@ const updateUsuario = async (req, res) => {
     }
 };
 
-// PATCH /api/preenfrio/usuarios/deshabilitar/:id
-// Corta el acceso sin perder la autoría de lo que esa cuenta registró.
-// Es la vía normal para dar de baja a alguien: el borrado falla en cuanto
-// la cuenta tiene recepciones o movimientos, que es casi siempre.
+// PATCH /api/preenfrio/usuarios/deshabilitar/:id   (motivo obligatorio)
 const deshabilitarUsuario = async (req, res) => {
     try {
         const { id } = req.params;
 
-        // Deshabilitarse a sí mismo cortaría la sesión a media operación, y
-        // si es el único admin dejaría el sistema sin administración.
         if (Number(id) === Number(req.id_usuario)) {
             return res.status(409).json({
                 error: "No puedes deshabilitar tu propia cuenta"
@@ -254,10 +224,13 @@ const deshabilitarUsuario = async (req, res) => {
             }
         }
 
-        const cuenta = await usuariosModel.setEstado(id, 0);
+        const cuenta = await usuariosModel.setEstado(id, 0, {
+            id_usuario_accion: req.id_usuario,
+            motivo: req.body.motivo
+        });
 
         res.status(200).json({
-            mensaje: `Cuenta "${cuenta.usuario}" deshabilitada. Pierde el acceso en su siguiente acción, aunque tenga la sesión abierta.`,
+            mensaje: `Cuenta "${cuenta.usuario}" deshabilitada. Pierde el acceso en su siguiente acción. Quedó registrado en el historial.`,
             usuario: cuenta
         });
     } catch (error) {
@@ -266,7 +239,7 @@ const deshabilitarUsuario = async (req, res) => {
     }
 };
 
-// PATCH /api/preenfrio/usuarios/habilitar/:id
+// PATCH /api/preenfrio/usuarios/habilitar/:id   (motivo opcional)
 const habilitarUsuario = async (req, res) => {
     try {
         const { id } = req.params;
@@ -283,9 +256,18 @@ const habilitarUsuario = async (req, res) => {
             });
         }
 
-        const cuenta = await usuariosModel.setEstado(id, 1);
+        // Si la persona ya no trabaja aquí, su cuenta no debe volver a abrirse
+        if (Number(existente.empleado_estado) === 0) {
+            return res.status(409).json({
+                error: `${existente.nombre_empleado} ${existente.apellidos_empleado} está dado de baja como empleado. Reactívalo primero en el módulo de bajas.`
+            });
+        }
 
-        // Un supervisor u operativo sin zona vigente no verá nada al volver
+        const cuenta = await usuariosModel.setEstado(id, 1, {
+            id_usuario_accion: req.id_usuario,
+            motivo: req.body.motivo
+        });
+
         const sinZona =
             [3, 4].includes(Number(existente.id_role)) &&
             Number(existente.camaras_asignadas) === 0;
@@ -303,9 +285,6 @@ const habilitarUsuario = async (req, res) => {
     }
 };
 
-// PATCH /api/preenfrio/usuarios/resetpassword/:id
-// Lo usa el admin cuando alguien olvida su contraseña. No pide la anterior;
-// para el cambio propio está /auth/cambiarpassword, que sí la exige.
 const resetPassword = async (req, res) => {
     try {
         const { id } = req.params;
@@ -333,15 +312,11 @@ const resetPassword = async (req, res) => {
     }
 };
 
-// DELETE /api/preenfrio/usuarios/eliminarusuario/:id
-// Solo prospera con cuentas que nunca registraron nada (altas por error).
-// Para dar de baja a alguien, la vía es deshabilitar.
+// Solo cuentas creadas por error, sin registros. Para dar de baja: deshabilitar.
 const deleteUsuario = async (req, res) => {
     try {
         const { id } = req.params;
 
-        // Nadie debe poder borrarse a sí mismo: dejaría la sesión activa
-        // con una cuenta inexistente, y si es el único admin, sin acceso.
         if (Number(id) === Number(req.id_usuario)) {
             return res.status(409).json({
                 error: "No puedes eliminar tu propia cuenta"
@@ -373,11 +348,9 @@ const deleteUsuario = async (req, res) => {
     } catch (error) {
         console.error("Error al eliminar usuario:", error);
 
-        // Recepciones, movimientos y despachos guardan quién los registró.
-        // Esa FK no tiene cascade a propósito: el histórico no debe perderse.
         if (error.code === "23503") {
             return res.status(409).json({
-                error: "No se puede eliminar: el usuario tiene registros asociados (recepciones, movimientos o evidencias). Deshabilítalo en su lugar: pierde el acceso y el histórico se conserva."
+                error: "No se puede eliminar: la cuenta ya tiene registros (recepciones, movimientos, evidencias o historial). Deshabilítala: pierde el acceso y el histórico se conserva."
             });
         }
 
@@ -389,12 +362,9 @@ const deleteUsuario = async (req, res) => {
 // ZONA DE TRABAJO
 // ---------------------------------------------------------
 
-// GET /api/preenfrio/usuarios/zonatrabajo/:id
-// Devuelve las asignaciones vigentes y el histórico.
 const getZonaTrabajo = async (req, res) => {
     try {
         const { id } = req.params;
-
         const usuario = await usuariosModel.getUsuarioById(id);
 
         if (!usuario) {
@@ -414,8 +384,6 @@ const getZonaTrabajo = async (req, res) => {
                 apellidos_empleado: usuario.apellidos_empleado,
                 alcance_total: usuario.alcance_total
             },
-            // Admin y Coordinador ven todo por su rol: las asignaciones no
-            // les cambian nada. Se avisa para que no se configure de más.
             nota: usuario.alcance_total
                 ? "Este rol ve todas las cámaras: no necesita asignaciones."
                 : null,
@@ -427,9 +395,6 @@ const getZonaTrabajo = async (req, res) => {
     }
 };
 
-// POST /api/preenfrio/usuarios/zonatrabajo/:id
-// Reemplaza la zona completa: llega la lista final de cámaras y el modelo
-// cierra las que sobran y abre las que faltan.
 const guardarZonaTrabajo = async (req, res) => {
     try {
         const { id } = req.params;
@@ -449,11 +414,15 @@ const guardarZonaTrabajo = async (req, res) => {
 
         const zona = await usuariosModel.reemplazarZonaTrabajo(id, camaras);
         const vigentes = zona.filter((z) => z.vigente);
+        const deBaja = vigentes.filter((z) => Number(z.camara_estado) === 0);
 
         res.status(200).json({
             mensaje: vigentes.length > 0
                 ? `Zona de trabajo actualizada: ${vigentes.length} cámara(s)`
                 : "Zona de trabajo vacía: este usuario no verá ningún dato",
+            avisos: deBaja.length > 0
+                ? [`${deBaja.map((z) => z.nombre_camara).join(", ")} está(n) dada(s) de baja: no la(s) verá hasta que se reactive(n).`]
+                : [],
             camaras: zona
         });
     } catch (error) {
@@ -469,8 +438,6 @@ const guardarZonaTrabajo = async (req, res) => {
     }
 };
 
-// POST /api/preenfrio/usuarios/zonatrabajo/:id/camara
-// Agrega UNA cámara sin tocar las demás.
 const asignarCamara = async (req, res) => {
     try {
         const { id } = req.params;
@@ -484,7 +451,6 @@ const asignarCamara = async (req, res) => {
 
         const asignada = await usuariosModel.asignarCamara(id, Number(id_camara));
 
-        // null significa que ya estaba vigente: no es un error, solo aviso.
         if (!asignada) {
             return res.status(200).json({
                 mensaje: "Esa cámara ya estaba asignada a este usuario"
@@ -508,9 +474,6 @@ const asignarCamara = async (req, res) => {
     }
 };
 
-// DELETE /api/preenfrio/usuarios/zonatrabajo/:id/camara/:id_camara
-// Da de baja la asignación marcando fecha_fin. No se borra el registro:
-// así queda constancia de que esa persona estuvo en esa cámara.
 const quitarCamara = async (req, res) => {
     try {
         const { id, id_camara } = req.params;
@@ -544,7 +507,6 @@ export const usuariosController = {
     habilitarUsuario,
     resetPassword,
     deleteUsuario,
-    // zona de trabajo
     getZonaTrabajo,
     guardarZonaTrabajo,
     asignarCamara,

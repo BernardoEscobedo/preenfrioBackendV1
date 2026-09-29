@@ -4,35 +4,26 @@ import { SQL_CAMARAS_REALES } from "../utils/camarasReales.sql.js";
 // ============================================================================
 // PULPEOS — CONTROL DE TEMPERATURA
 // ============================================================================
-// Un pulpeo es la medición de temperatura DENTRO de la fruta: el termómetro
-// de aguja entra a la pulpa, no mide el aire de la cámara. Es el dato que
+// Un pulpeo es la medición de temperatura DENTRO de la fruta. Es el dato que
 // respalda la cadena de frío ante el cliente.
 //
-// ESTRUCTURA EN TRES NIVELES
+// ESTRUCTURA
 //   pulpeos            la medición sobre el BLOQUE físico completo
-//   pulpeos_detalle    el desglose por proceso, porque un bloque puede
-//                      mezclar fruta de varias fincas y cada una puede
-//                      venir a distinta temperatura
-//   pulpeos_evidencia  la foto del termómetro
+//   pulpeos_detalle    el desglose por proceso (opcional)
+//   pulpeos_evidencia  fotos/videos en SharePoint, ligados al PULPEO (v3.0)
 //
-// EL DATO QUE DECIDE LA SALIDA
-//   temperatura_promedio contra temperatura_objetivo. Mientras no llegue al
-//   objetivo, la fruta sigue en preenfrío.
+// LA BAJA ES LÓGICA: estado = 0 para una lectura errónea. No se borra.
 //
-// LA BAJA ES LÓGICA (v2.2)
-//   estado = 0 para una lectura errónea. No se borra: dejaría un hueco
-//   inexplicable en la secuencia de pulpeos del bloque, y esa secuencia es
-//   evidencia.
+// ALCANCE POR CÁMARA REAL (SQL_CAMARAS_REALES), el mismo criterio que
+// bloques.model.
 //
-// CORRECCIÓN DE LA AUDITORÍA · ALCANCE POR CÁMARA REAL
-//   El listado y los pendientes filtraban por produccion.id_camara, la
-//   cámara del plan. Si el camión se desvió en el andén, el supervisor de
-//   la cámara donde estaba la fruta no veía sus pulpeos pendientes. Ahora
-//   se usa SQL_CAMARAS_REALES, el mismo criterio que bloques.model.
+// v3.0 · Las evidencias cuelgan del pulpeo, no del desglose: un bloque de un
+// solo lote se pulpea sin desglose y antes esa foto no tenía dónde quedar.
+// Los conteos ya leen pulpeos_evidencia.id_pulpeo.
 // ============================================================================
 
 // Condición de alcance reutilizable: el bloque tiene fruta en alguna de las
-// cámaras del usuario. Recibe el alias del bloque y el número de parámetro.
+// cámaras del usuario.
 const ALCANCE_BLOQUE = (aliasBloque, param) => `
     (
         ${param}::INT[] IS NULL
@@ -58,22 +49,20 @@ const SELECT_PULPEO = `
             WHEN 0 THEN 'Cancelado'
             ELSE 'Otro'
         END AS estado_texto,
-        -- Diferencia contra el objetivo: positiva significa que la fruta
-        -- todavía está más caliente de lo que debería.
         ROUND(p.temperatura_promedio - p.temperatura_objetivo, 2) AS desviacion,
         CASE
             WHEN p.temperatura_promedio <= p.temperatura_objetivo
                 THEN TRUE ELSE FALSE
         END AS alcanzo_objetivo,
-        -- Quién lo tomó: ante un reclamo, es el dato que se busca
         e.nombre    AS nombre_usuario,
         e.apellidos AS apellidos_usuario,
         u.usuario,
         (SELECT COUNT(*) FROM pulpeos_detalle d
           WHERE d.id_pulpeo = p.id_pulpeo) AS procesos_medidos,
         (SELECT COUNT(*) FROM pulpeos_evidencia ev
-          JOIN pulpeos_detalle d2 ON d2.id_pulpeo_detalle = ev.id_pulpeo_detalle
-          WHERE d2.id_pulpeo = p.id_pulpeo) AS fotos
+          WHERE ev.id_pulpeo = p.id_pulpeo AND ev.tipo_archivo = 1) AS fotos,
+        (SELECT COUNT(*) FROM pulpeos_evidencia ev
+          WHERE ev.id_pulpeo = p.id_pulpeo AND ev.tipo_archivo = 2) AS videos
     FROM pulpeos p
     JOIN bloques_fruta  b ON b.id_bloque   = p.id_bloque
     LEFT JOIN usuarios  u ON u.id_usuario  = p.id_usuario
@@ -129,7 +118,6 @@ const getPulpeoById = async (id_pulpeo) => {
 // ----------------------------------------------------------------------------
 // Desglose por proceso
 // ----------------------------------------------------------------------------
-// Cuando el bloque mezcla lotes, permite saber cuál venía más caliente.
 const getDetalle = async (id_pulpeo) => {
     const result = await db.query(
         `
@@ -148,7 +136,7 @@ const getDetalle = async (id_pulpeo) => {
             s.calidad AS calidad_sku,
             cc.cliente,
             (SELECT COUNT(*) FROM pulpeos_evidencia ev
-              WHERE ev.id_pulpeo_detalle = d.id_pulpeo_detalle) AS fotos
+              WHERE ev.id_pulpeo_detalle = d.id_pulpeo_detalle) AS evidencias
         FROM pulpeos_detalle d
         JOIN produccion         p   ON p.id_produccion = d.id_produccion
         LEFT JOIN fincas        f   ON f.id_finca      = p.id_finca
@@ -166,9 +154,6 @@ const getDetalle = async (id_pulpeo) => {
 // ----------------------------------------------------------------------------
 // Alta con su detalle — EN TRANSACCIÓN
 // ----------------------------------------------------------------------------
-// El pulpeo y su desglose se guardan juntos o no se guardan: un pulpeo sin
-// detalle cuando el bloque mezcla lotes es una medición que no se puede
-// atribuir, y un detalle huérfano no significa nada.
 const createPulpeo = async ({
     id_bloque,
     fecha_hora,
@@ -207,8 +192,6 @@ const createPulpeo = async ({
 
         const pulpeo = resultPulpeo.rows[0];
 
-        // El detalle es opcional: si el bloque tiene un solo proceso, la
-        // medición del encabezado ya lo dice todo.
         for (const linea of detalle) {
             await client.query(
                 `
@@ -239,9 +222,7 @@ const createPulpeo = async ({
     }
 };
 
-// Edición limitada a lo administrativo. Las temperaturas NO se editan: una
-// lectura es un hecho puntual, no un dato corregible. Si estuvo mal, se
-// cancela y se toma otra — así queda rastro de que hubo una corrección.
+// Las temperaturas NO se editan: una lectura es un hecho puntual.
 const updatePulpeo = async (id_pulpeo, { numero_pulpeo, observaciones }) => {
     const result = await db.query(
         `
@@ -256,8 +237,6 @@ const updatePulpeo = async (id_pulpeo, { numero_pulpeo, observaciones }) => {
     return result.rows[0];
 };
 
-// Cancelar una lectura errónea. Se conserva la fila: borrarla dejaría un
-// hueco inexplicable en la secuencia de pulpeos del bloque.
 const cancelarPulpeo = async (id_pulpeo) => {
     const result = await db.query(
         `UPDATE pulpeos SET estado = 0 WHERE id_pulpeo = $1 RETURNING *`,
@@ -274,8 +253,6 @@ const reactivarPulpeo = async (id_pulpeo) => {
     return result.rows[0];
 };
 
-// Siguiente número de pulpeo del bloque. Los pulpeos se numeran en
-// secuencia (1º, 2º, 3º...) para seguir la curva de enfriamiento.
 const getSiguienteNumero = async (id_bloque) => {
     const result = await db.query(
         `
@@ -290,8 +267,6 @@ const getSiguienteNumero = async (id_bloque) => {
 // ----------------------------------------------------------------------------
 // Curva de enfriamiento de un bloque
 // ----------------------------------------------------------------------------
-// Todos los pulpeos en orden cronológico, con las horas transcurridas desde
-// el armado. Es el gráfico que demuestra la cadena de frío ante el cliente.
 const getCurva = async (id_bloque) => {
     const result = await db.query(
         `
@@ -303,13 +278,10 @@ const getCurva = async (id_bloque) => {
             p.temperatura_promedio,
             ROUND(p.temperatura_promedio - p.temperatura_objetivo, 2) AS desviacion,
             p.estado,
-            -- Horas desde que se armó el bloque: el eje X de la curva
             ROUND(
                 EXTRACT(EPOCH FROM (p.fecha_hora - b.fecha_hora_armado)) / 3600,
                 1
             ) AS horas_desde_armado,
-            -- Cuánto bajó respecto a la medición anterior. LAG mira la fila
-            -- previa sin necesidad de un self-join.
             ROUND(
                 p.temperatura_promedio - LAG(p.temperatura_promedio)
                     OVER (ORDER BY p.fecha_hora),
@@ -328,8 +300,6 @@ const getCurva = async (id_bloque) => {
 // ----------------------------------------------------------------------------
 // Bloques que necesitan pulpeo
 // ----------------------------------------------------------------------------
-// Los que llevan horas sin medición, o cuya última lectura no alcanzó el
-// objetivo. Es el reporte de pendientes del turno.
 const getPendientes = async (horas_sin_pulpeo = 4, camaras = null) => {
     const result = await db.query(
         `
@@ -361,8 +331,6 @@ const getPendientes = async (horas_sin_pulpeo = 4, camaras = null) => {
             END AS situacion
         FROM bloques_fruta b
         LEFT JOIN LATERAL (
-            -- LATERAL trae la última fila por bloque sin una subconsulta
-            -- correlacionada por cada columna
             SELECT p.id_pulpeo, p.fecha_hora,
                    p.temperatura_promedio, p.temperatura_objetivo
             FROM pulpeos p
@@ -385,17 +353,16 @@ const getPendientes = async (horas_sin_pulpeo = 4, camaras = null) => {
     return result.rows;
 };
 
-// Evidencias fotográficas de una línea del detalle.
-// ⚠️ La SUBIDA de fotos necesita multer + sharp, que todavía no están
-// instalados. Este método solo lista lo que ya exista.
-const getEvidencias = async (id_pulpeo_detalle) => {
+// Evidencias del pulpeo (referencias a SharePoint). El listado completo con
+// enlaces lo sirve el módulo de evidencias: GET /evidencias/pulpeos/:id
+const getEvidencias = async (id_pulpeo) => {
     const result = await db.query(
         `
         SELECT * FROM pulpeos_evidencia
-        WHERE id_pulpeo_detalle = $1
-        ORDER BY fecha_hora
+        WHERE id_pulpeo = $1
+        ORDER BY fecha_hora, id_evidencia
         `,
-        [id_pulpeo_detalle]
+        [id_pulpeo]
     );
     return result.rows;
 };
