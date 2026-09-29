@@ -4,7 +4,6 @@ import { validarCamara, validarIdCamara } from "../middlewares/camaras.middlewar
 import { cargarAlcance } from "../middlewares/alcance.middleware.js";
 import {
     verifyToken,
-    verifyAdmin,
     verifyCoordinador,
     verifyOperativo
 } from "../middlewares/jwt.middleware.js";
@@ -12,7 +11,7 @@ import {
 const router = Router();
 
 // ============================================================================
-// CÁMARAS  ·  ver = operativo+ · crear/editar = coordinador+ · eliminar = admin
+// CÁMARAS  ·  ver = operativo+ · crear/editar = coordinador+
 // ============================================================================
 // VER queda en operativo porque este catálogo alimenta los DROPDOWNS de
 // todo el sistema: sin él, un operativo no podría elegir la cámara destino
@@ -21,13 +20,22 @@ const router = Router();
 // CREAR y EDITAR suben a coordinador: la capacidad que se define aquí es el
 // tope que respetan los triggers de recepción y cola. Capturarla mal
 // descuadra la operación de toda la planta, no es decisión de piso.
+//
+// v3.0 · YA NO HAY BORRADO
+//   La ruta DELETE /eliminarcamara/:id_camara se retiró. La baja es lógica
+//   y vive en el módulo de bajas (solo admin), que exige motivo, verifica
+//   que la cámara esté vacía y deja registro en el historial:
+//
+//       PATCH /api/preenfrio/bajas/camaras/:id
+//       PATCH /api/preenfrio/bajas/camaras/:id/reactivar
+// ============================================================================
 
 // ---- Consultas (filtradas por alcance) ----
+// Incluye las dadas de baja al final: es también la pantalla del catálogo.
 router.get("/camaras", verifyToken, verifyOperativo, cargarAlcance, camarasController.getCamaras);
 
-// Por tipo: 1=preenfrío · 2=conservación.
-// Útil para dropdowns que solo aceptan uno de los dos (ej. destino al
-// mover a conserva).
+// Por tipo: 1=preenfrío · 2=conservación. Solo operativas: alimenta
+// dropdowns como el destino al mover a conserva.
 router.get("/tipo/:tipo", verifyToken, verifyOperativo, cargarAlcance, camarasController.getCamarasByTipo);
 
 // El controller valida el alcance sobre el resultado
@@ -39,8 +47,5 @@ router.post("/registrarcamara", verifyToken, verifyCoordinador, validarCamara, c
 // El controller impide bajar la capacidad por debajo de lo que la cámara
 // ya tiene dentro
 router.put("/actualizarcamara/:id_camara", verifyToken, verifyCoordinador, validarIdCamara, validarCamara, camarasController.updateCamara);
-
-// ---- Baja ----
-router.delete("/eliminarcamara/:id_camara", verifyToken, verifyAdmin, validarIdCamara, camarasController.deleteCamara);
 
 export default router;
