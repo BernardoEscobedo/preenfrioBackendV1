@@ -19,8 +19,22 @@ import { db } from "../database/connection.database.js";
 //   despachos.cantidad_tarimas y cantidad_cajas los mantiene
 //   trg_recalcular_totales_despacho sumando el detalle.
 //
+// ⚠️ INOCUIDAD POR DESPACHO
+//   La inspección de la unidad se guarda en el propio despacho:
+//       inocuidad                NULL pendiente · 0 rechazada · 1 aprobada
+//       inocuidad_fecha          la pone la BD (trg_validar_cierre)
+//       inocuidad_id_usuario     el usuario de la sesión
+//       inocuidad_observaciones  texto libre
+//
+//   trg_validar_cierre (BEFORE INSERT OR UPDATE) además:
+//     · borra la inspección si cambia el transporte de un borrador
+//     · impide cambiar transporte o inspección de un despacho cerrado
+//     · no deja cerrar sin líneas ni sin inocuidad = 1
+//     · no deja cerrar con fruta de otro cliente salvo que la transacción
+//       traiga app.confirmar_reasignacion = '1'
+//
 // ESTADOS
-//   1 = borrador  se puede editar, agregar líneas y eliminar
+//   1 = borrador  se puede editar, agregar líneas, inspeccionar y eliminar
 //   2 = cerrado   ya salió; solo admite corrección auditada
 //
 //   NO existe "cancelado" a propósito: un despacho o salió o no salió.
@@ -43,6 +57,8 @@ import { db } from "../database/connection.database.js";
 // EL FILTRO DE ALCANCE ES POR EXISTENCIA DE LÍNEA
 //   · EXISTS     → alguna de sus líneas sale de una cámara del alcance
 //   · NOT EXISTS → es un borrador todavía sin líneas
+//
+// ?inocuidad: 1 aprobada · 0 rechazada · 'pendiente' sin inspección
 const getDespachos = async (
     {
         estado = null,
@@ -50,7 +66,9 @@ const getDespachos = async (
         id_transporte = null,
         fecha_desde = null,
         fecha_hasta = null,
-        buscar = null
+        buscar = null,
+        inocuidad = null,
+        inocuidad_pendiente = false
     } = {},
     camaras = null
 ) => {
@@ -80,10 +98,22 @@ const getDespachos = async (
                   WHERE dd.id_despacho = v.id_despacho
               )
           )
+          AND ($8::INT IS NULL OR v.inocuidad = $8)
+          AND ($9::BOOLEAN IS FALSE OR v.inocuidad IS NULL)
         ORDER BY v.fecha_despacho DESC, v.id_despacho DESC
         LIMIT 500
         `,
-        [estado, id_cc, id_transporte, fecha_desde, fecha_hasta, buscar, camaras]
+        [
+            estado,
+            id_cc,
+            id_transporte,
+            fecha_desde,
+            fecha_hasta,
+            buscar,
+            camaras,
+            inocuidad,
+            inocuidad_pendiente
+        ]
     );
     return result.rows;
 };
@@ -118,7 +148,8 @@ const getDetalle = async (id_despacho) => {
 // la secuencia seq_folio_despacho (numeración de negocio desde 70000).
 // Calcularlo con MAX(folio)+1 abriría una ventana de carrera.
 //
-// Nace en estado 1 (borrador).
+// Nace en estado 1 (borrador) y con la inspección PENDIENTE (inocuidad
+// NULL): trg_validar_cierre exige que se cree en borrador.
 const createDespacho = async ({
     id_transporte,
     fecha_despacho,
@@ -163,7 +194,10 @@ const createDespacho = async ({
 // Edición del encabezado
 // ----------------------------------------------------------------------------
 // NO toca cantidad_tarimas ni cantidad_cajas: los deriva el trigger.
-// Tampoco el folio ni el estado, que tienen su propia vía.
+// Tampoco el folio, el estado ni la inspección, que tienen su propia vía.
+//
+// ⚠️ Si cambia id_transporte en un borrador, trg_validar_cierre BORRA la
+// inspección: la caja que se revisó ya no es la que va a cargar.
 const updateDespacho = async (
     id_despacho,
     {
@@ -210,16 +244,101 @@ const updateDespacho = async (
     return result.rows[0];
 };
 
-// Cerrar: el camión salió.
-const cerrarDespacho = async (id_despacho) => {
+// ----------------------------------------------------------------------------
+// INSPECCIÓN DE INOCUIDAD
+// ----------------------------------------------------------------------------
+// Solo borradores (estado = 1). La fecha NO se manda: la asigna
+// trg_validar_cierre con CURRENT_TIMESTAMP. El usuario sale de la sesión.
+//
+// Devuelve undefined si el despacho no existe o ya no está en borrador.
+const registrarInocuidad = async (
+    id_despacho,
+    { inocuidad, id_usuario, observaciones }
+) => {
     const result = await db.query(
-        `UPDATE despachos SET estado = 2 WHERE id_despacho = $1 RETURNING *`,
-        [id_despacho]
+        `
+        UPDATE despachos
+        SET inocuidad = $1,
+            inocuidad_id_usuario = $2,
+            inocuidad_observaciones = $3
+        WHERE id_despacho = $4 AND estado = 1
+        RETURNING *
+        `,
+        [inocuidad, id_usuario, observaciones, id_despacho]
     );
     return result.rows[0];
 };
 
+// ----------------------------------------------------------------------------
+// Auditoría (uso interno)
+// ----------------------------------------------------------------------------
+// Recibe el ejecutor (db o un cliente dentro de transacción) para poder
+// registrarse junto con el cierre.
+const insertarAuditoria = async (
+    ejecutor,
+    { id_despacho, estado_al_editar, motivo, cambios, id_usuario }
+) => {
+    const result = await ejecutor.query(
+        `
+        INSERT INTO despachos_auditoria (
+            id_despacho, estado_al_editar, motivo, cambios, id_usuario
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING *
+        `,
+        [id_despacho, estado_al_editar, motivo, cambios, id_usuario]
+    );
+    return result.rows[0];
+};
+
+// ----------------------------------------------------------------------------
+// Cerrar: el camión salió.
+// ----------------------------------------------------------------------------
+// Va en TRANSACCIÓN por dos motivos:
+//
+//   1. trg_validar_cierre rechaza el cierre con fruta de otro cliente salvo
+//      que la MISMA transacción traiga app.confirmar_reasignacion = '1'.
+//      set_config(..., true) solo vive dentro de la transacción: con un
+//      UPDATE suelto, ?confirmar=1 nunca llegaba a la BD y el cierre
+//      reventaba.
+//
+//   2. Si se cerró con reasignación, la auditoría se guarda en la misma
+//      transacción: o quedan las dos cosas o ninguna.
+const cerrarDespacho = async (
+    id_despacho,
+    { confirmarReasignacion = false, auditoria = null } = {}
+) => {
+    const client = await db.connect();
+
+    try {
+        await client.query("BEGIN");
+
+        await client.query(
+            `SELECT set_config('app.confirmar_reasignacion', $1, true)`,
+            [confirmarReasignacion ? "1" : ""]
+        );
+
+        const result = await client.query(
+            `UPDATE despachos SET estado = 2 WHERE id_despacho = $1 RETURNING *`,
+            [id_despacho]
+        );
+
+        if (result.rows[0] && auditoria) {
+            await insertarAuditoria(client, { id_despacho, ...auditoria });
+        }
+
+        await client.query("COMMIT");
+        return result.rows[0];
+    } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+    } finally {
+        client.release();
+    }
+};
+
 // Reabrir a borrador. Solo admin, y siempre con auditoría.
+// La inspección se conserva: la unidad no cambió por reabrir el documento.
 const reabrirDespacho = async (id_despacho) => {
     const result = await db.query(
         `UPDATE despachos SET estado = 1 WHERE id_despacho = $1 RETURNING *`,
@@ -360,25 +479,7 @@ const getCamarasDelDespacho = async (id_despacho) => {
 // ----------------------------------------------------------------------------
 // Un despacho cerrado no se elimina, pero sí admite corregir datos
 // administrativos. Cada corrección exige motivo y queda registrada.
-const registrarAuditoria = async ({
-    id_despacho,
-    estado_al_editar,
-    motivo,
-    cambios,
-    id_usuario
-}) => {
-    const result = await db.query(
-        `
-        INSERT INTO despachos_auditoria (
-            id_despacho, estado_al_editar, motivo, cambios, id_usuario
-        )
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING *
-        `,
-        [id_despacho, estado_al_editar, motivo, cambios, id_usuario]
-    );
-    return result.rows[0];
-};
+const registrarAuditoria = async (datos) => insertarAuditoria(db, datos);
 
 const getAuditoria = async (id_despacho) => {
     const result = await db.query(
@@ -449,6 +550,7 @@ const despachosModel = {
     getDetalle,
     createDespacho,
     updateDespacho,
+    registrarInocuidad,
     cerrarDespacho,
     reabrirDespacho,
     deleteDespacho,

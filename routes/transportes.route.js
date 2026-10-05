@@ -3,14 +3,12 @@ import { transportesController } from "../controllers/transportes.controller.js"
 import transportesModel from "../models/transportes.model.js";
 import {
     validarTransporte,
-    validarInocuidad,
     validarIdTransporte
 } from "../middlewares/transportes.middleware.js";
 import { conservarCampos } from "../middlewares/conservar.middleware.js";
 import {
     verifyToken,
     verifyCoordinador,
-    verifySupervisor,
     verifyOperativo
 } from "../middlewares/jwt.middleware.js";
 
@@ -18,26 +16,29 @@ const router = Router();
 
 // ============================================================================
 // TRANSPORTES
-// ver = operativo+ · inocuidad = supervisor+ · crear/editar/baja = coordinador+
+// ver = operativo+ · crear/editar/baja = coordinador+
 // ============================================================================
 // Sin cargarAlcance: una unidad recoge en cualquier planta.
 //
-// POR QUÉ LA INOCUIDAD TIENE SU PROPIO ENDPOINT Y SU PROPIO GUARD
-//   Es una decisión que se toma en el andén, con la unidad enfrente, y la
-//   toma el SUPERVISOR de turno — no coordinación. Obligarlo a usar el PUT
-//   completo significaría reenviar placas, celular y datos del operador solo
-//   para marcar un rechazo: una invitación a errores de captura.
+// UN TRANSPORTE ES UN SERVICIO
+//   Se arma con cuatro IDs de catálogo: línea fletera, operador,
+//   tractocamión y caja refrigerada. Los catálogos tienen sus propias rutas:
+//     /lineas-fleteras · /operadores · /tractocamiones · /cajas-refrigeradas
 //
-//   Por eso: PATCH /:id/inocuidad, con verifySupervisor y un middleware que
-//   solo valida ese campo.
+// ⚠️ SE RETIRÓ PATCH /:id/inocuidad
+//   La inspección ya no es un dato del transporte: se registra en cada
+//   despacho con PATCH /despachos/:id/inocuidad (supervisor+). Una caja
+//   aprobada ayer no está aprobada hoy.
 //
-// ALTA Y EDICIÓN en coordinador: los datos de la unidad son los que
+// ALTA Y EDICIÓN en coordinador: los datos del servicio son los que
 // aparecen en el documento de despacho y en el reclamo si algo sale mal.
 //
 // FILTROS DEL LISTADO
-//   ?estado=1       solo activos (para dropdowns de despacho)
-//   ?inocuidad=0    unidades rechazadas (reporte de inspección)
-//   ?buscar=texto   línea, operador, placas o número económico
+//   ?estado=1             solo activos
+//   ?completos=1          solo servicios con sus cuatro catálogos activos
+//                         (dropdown de despacho)
+//   ?id_linea_fletera=3   servicios de una línea
+//   ?buscar=texto         línea, RFC, operador, placas o número económico
 // ============================================================================
 
 // ---- Consultas ----
@@ -46,28 +47,24 @@ router.get("/", verifyToken, verifyOperativo, transportesController.getTransport
 router.get("/:id", verifyToken, verifyOperativo, validarIdTransporte, transportesController.getTransporteById);
 
 // ---- Alta y edición ----
-// El duplicado se mide por tracto + caja, ignorando guiones y espacios:
-// "15AN7H" y "15-AN-7H" son la misma placa.
+// El duplicado se mide por la combinación completa de los cuatro IDs.
 router.post("/", verifyToken, verifyCoordinador, validarTransporte, transportesController.createTransporte);
 
-// ⚠️ conservarCampos va ANTES del validador, y aquí es crítico.
-// Como la inocuidad tiene su propio PATCH, lo normal es que el formulario
-// de edición NO la mande. Sin esto, el validador le ponía 1 por defecto:
-// editar el celular del operador APROBABA una unidad que el supervisor
-// había rechazado, y el bloqueo del cierre de despacho dejaba de protegerla.
+// conservarCampos va ANTES del validador: si el formulario no manda
+// 'estado', se conserva el actual en vez de reactivar el servicio.
+//
+// Si el servicio ya tiene despachos, NO se puede cambiar su combinación:
+// el controller responde 409 y la BD lo respalda con
+// trg_proteger_transporte_asignado.
 router.put(
     "/:id",
     verifyToken,
     verifyCoordinador,
     validarIdTransporte,
-    conservarCampos(transportesModel.getTransporteById, ["inocuidad", "estado"]),
+    conservarCampos(transportesModel.getTransporteById, ["estado"]),
     validarTransporte,
     transportesController.updateTransporte
 );
-
-// ---- Inspección sanitaria ----
-// Supervisor+: es quien revisa la caja en el andén.
-router.patch("/:id/inocuidad", verifyToken, verifySupervisor, validarIdTransporte, validarInocuidad, transportesController.setInocuidad);
 
 // ---- Baja ----
 // Lógica (estado = 0): despachos.id_transporte sigue apuntando aquí y ante

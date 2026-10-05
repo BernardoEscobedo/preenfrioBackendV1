@@ -1,5 +1,3 @@
-// ⚠️ Esta línea va PRIMERO: en ESM los imports se evalúan antes que el
-// cuerpo del archivo, y la conexión a la BD necesita el .env ya cargado.
 import "dotenv/config";
 
 import express from "express";
@@ -25,6 +23,12 @@ import skuRouter from "./routes/sku.route.js";
 // ---- Bloque 4 · Clientes y transporte ----
 import cedisRouter from "./routes/cedis.route.js";
 import transportesRouter from "./routes/transportes.route.js";
+// Catálogos del transporte (etapa 1): un transporte = línea + operador +
+// tractocamión + caja refrigerada
+import lineasFleterasRouter from "./routes/lineasFleteras.route.js";
+import operadoresRouter from "./routes/operadores.route.js";
+import tractocamionesRouter from "./routes/tractocamiones.route.js";
+import cajasRefrigeradasRouter from "./routes/cajasRefrigeradas.route.js";
 
 // ---- Bloque 5 · Producción ----
 import produccionRouter from "./routes/produccion.route.js";
@@ -122,6 +126,10 @@ app.use(`${API}/sku`, skuRouter);
 // ---- Bloque 4 ----
 app.use(`${API}/cedis`, cedisRouter);
 app.use(`${API}/transportes`, transportesRouter);
+app.use(`${API}/lineas-fleteras`, lineasFleterasRouter);
+app.use(`${API}/operadores`, operadoresRouter);
+app.use(`${API}/tractocamiones`, tractocamionesRouter);
+app.use(`${API}/cajas-refrigeradas`, cajasRefrigeradasRouter);
 
 // ---- Bloques 5 a 11 · operación ----
 app.use(`${API}/produccion`, produccionRouter);

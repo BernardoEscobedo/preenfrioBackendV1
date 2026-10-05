@@ -25,6 +25,16 @@ import cedisModel from "../models/cedis.model.js";
 //   leer el prefijo, un fallo respondería 200 y el operador creería que la
 //   fruta volvió a la cámara cuando sigue cargada en el camión.
 //
+// ⚠️ LA INOCUIDAD ES DEL DESPACHO, NO DEL TRANSPORTE
+//   Se registra con PATCH /:id/inocuidad sobre el borrador. El cierre exige
+//   despachos.inocuidad = 1; ya no consulta transportes.inocuidad. Si el
+//   borrador cambia de transporte, la BD borra la inspección y hay que
+//   volver a revisar la nueva caja.
+//
+// ⚠️ LOS TRIGGERS DE LA BD SON LA ÚLTIMA PALABRA
+//   trg_validar_cierre y los de inventario lanzan excepciones (P0001) con
+//   mensajes ya legibles. Se devuelven como 409 en vez de un 500 genérico.
+//
 // EL ALCANCE SOBRE UN DOCUMENTO SIN CÁMARA
 //   El despacho no tiene cámara: la tienen sus líneas. Un despacho ya
 //   armado pertenece a quien puso la fruta; uno vacío todavía no tiene
@@ -39,6 +49,27 @@ import cedisModel from "../models/cedis.model.js";
 
 /** fn_quitar_linea_despacho marca el éxito con este prefijo. */
 const esExito = (respuesta) => String(respuesta).startsWith("OK:");
+
+/**
+ * Errores que vienen de la BD con un mensaje útil para el usuario.
+ * Devuelve true si ya respondió.
+ */
+const responderErrorBD = (res, error) => {
+    // RAISE EXCEPTION de los triggers: el mensaje ya está en español
+    if (error.code === "P0001") {
+        res.status(409).json({ error: error.message });
+        return true;
+    }
+    // CHECK violado (p. ej. chk_despachos_inocuidad_revision)
+    if (error.code === "23514") {
+        res.status(409).json({
+            error: "La BD rechazó el dato por una regla de integridad" +
+                (error.constraint ? ` (${error.constraint})` : "")
+        });
+        return true;
+    }
+    return false;
+};
 
 /**
  * Valida que el usuario tenga acceso a un despacho ya armado.
@@ -68,7 +99,47 @@ const validarAlcanceDespacho = async (id_despacho, camaras) => {
     return null;
 };
 
+/**
+ * Valida que un transporte pueda asignarse a un despacho.
+ * Devuelve { status, error } si no puede, o { transporte } si sí.
+ *
+ * Desde la etapa de catálogos, el servicio debe tener sus cuatro piezas
+ * (línea, operador, tracto, caja) y todas activas: sin ellas, la BD no
+ * deja registrar la inspección y el despacho nunca podría cerrarse.
+ */
+const validarTransporteParaDespacho = async (id_transporte) => {
+    const transporte = await transportesModel.getTransporteById(id_transporte);
+
+    if (!transporte) {
+        return { status: 409, error: "El transporte indicado no existe" };
+    }
+
+    if (Number(transporte.estado) === 0) {
+        return {
+            status: 409,
+            error: `El transporte "${transporte.razon_social} - ${transporte.nombre_operador}" está dado de baja`
+        };
+    }
+
+    if (!transporte.catalogos_completos) {
+        return {
+            status: 409,
+            error: `El transporte #${transporte.id_transporte} es un registro anterior sin línea, operador, tracto y caja de catálogo. Vincúlalo en el catálogo de transportes antes de usarlo.`
+        };
+    }
+
+    if (!transporte.catalogos_activos) {
+        return {
+            status: 409,
+            error: `Alguna pieza del transporte #${transporte.id_transporte} (línea, operador, tracto o caja) está dada de baja. Elige otro servicio.`
+        };
+    }
+
+    return { transporte };
+};
+
 // GET /api/preenfrio/despachos?estado=1&buscar=texto
+//   ?inocuidad=1 | 0 | pendiente
 const getDespachos = async (req, res) => {
     try {
         const {
@@ -77,8 +148,11 @@ const getDespachos = async (req, res) => {
             id_transporte,
             fecha_desde,
             fecha_hasta,
-            buscar
+            buscar,
+            inocuidad
         } = req.query;
+
+        const pendiente = inocuidad === "pendiente";
 
         const despachos = await despachosModel.getDespachos(
             {
@@ -87,7 +161,12 @@ const getDespachos = async (req, res) => {
                 id_transporte: id_transporte ? Number(id_transporte) : null,
                 fecha_desde: fecha_desde || null,
                 fecha_hasta: fecha_hasta || null,
-                buscar: buscar || null
+                buscar: buscar || null,
+                inocuidad:
+                    !pendiente && inocuidad !== undefined && inocuidad !== ""
+                        ? Number(inocuidad)
+                        : null,
+                inocuidad_pendiente: pendiente
             },
             req.camaras
         );
@@ -104,6 +183,7 @@ const getDespachos = async (req, res) => {
 const getDespachoById = async (req, res) => {
     try {
         const { id } = req.params;
+
         const despacho = await despachosModel.getDespachoById(id);
 
         if (!despacho) {
@@ -163,6 +243,14 @@ const getDisponible = async (req, res) => {
             return res.status(404).json({ error: "Despacho no encontrado" });
         }
 
+        // Mismo criterio que el resto de acciones sobre el documento: un
+        // despacho armado con fruta de otra planta no se consulta desde
+        // aquí. Antes esta ruta devolvía su encabezado sin revisarlo.
+        const problema = await validarAlcanceDespacho(id, req.camaras);
+        if (problema) {
+            return res.status(problema.status).json({ error: problema.error });
+        }
+
         const verTodos = todos === "1" || todos === "true";
 
         const disponible = await despachosModel.getDisponibleParaPicking(
@@ -194,23 +282,16 @@ const getDisponible = async (req, res) => {
 // ----------------------------------------------------------------------------
 // POST /api/preenfrio/despachos
 // ----------------------------------------------------------------------------
-// Crea el documento en borrador. El folio lo genera la BD con la secuencia,
-// no el backend.
+// Crea el documento en borrador, con la inspección PENDIENTE. El folio lo
+// genera la BD con la secuencia, no el backend.
 const createDespacho = async (req, res) => {
     try {
         const { id_transporte, id_cc } = req.body;
 
         // ---- Transporte ----
-        const transporte = await transportesModel.getTransporteById(id_transporte);
-
-        if (!transporte) {
-            return res.status(409).json({ error: "El transporte indicado no existe" });
-        }
-
-        if (transporte.estado === 0) {
-            return res.status(409).json({
-                error: `El transporte "${transporte.razon_social} - ${transporte.nombre_operador}" está dado de baja`
-            });
+        const validacion = await validarTransporteParaDespacho(id_transporte);
+        if (validacion.error) {
+            return res.status(validacion.status).json({ error: validacion.error });
         }
 
         // ---- Cliente ----
@@ -229,15 +310,11 @@ const createDespacho = async (req, res) => {
         const nuevo = await despachosModel.createDespacho(req.body);
         const completo = await despachosModel.getDespachoById(nuevo.id_despacho);
 
-        // La inocuidad se avisa al crear y se BLOQUEA al cerrar. Avisar
-        // desde el borrador da tiempo de resolverlo antes de cargar.
-        const avisos = [];
-
-        if (Number(transporte.inocuidad) === 0) {
-            avisos.push(
-                `⚠️ La unidad ${transporte.placas_caja} tiene la INOCUIDAD RECHAZADA. No podrás cerrar el despacho hasta que apruebe la inspección.`
-            );
-        }
+        // La inspección se avisa al crear y se BLOQUEA al cerrar. Avisar
+        // desde el borrador da tiempo de revisar la caja antes de cargar.
+        const avisos = [
+            `Inspección de inocuidad PENDIENTE para la caja ${completo.placas_caja}. Regístrala antes de cerrar el despacho.`
+        ];
 
         res.status(201).json({
             mensaje: `Despacho ${completo.folio_despacho} creado en borrador`,
@@ -246,6 +323,8 @@ const createDespacho = async (req, res) => {
         });
     } catch (error) {
         console.error("Error al crear el despacho:", error);
+
+        if (responderErrorBD(res, error)) return;
 
         if (error.code === "23503") {
             return res.status(409).json({
@@ -266,10 +345,14 @@ const createDespacho = async (req, res) => {
 // Editar el encabezado. Si el despacho está CERRADO exige motivo y registra
 // auditoría: el camión ya salió, así que cualquier cambio es una corrección
 // administrativa que alguien tendrá que justificar después.
+//
+// ⚠️ TRANSPORTE
+//   · Borrador: se puede cambiar, pero la BD BORRA la inspección. Se avisa.
+//   · Cerrado:  no se puede cambiar. Hay que reabrir primero (admin).
 const updateDespacho = async (req, res) => {
     try {
         const { id } = req.params;
-        const { motivo } = req.body;
+        const { motivo, id_transporte } = req.body;
 
         const existente = await despachosModel.getDespachoById(id);
 
@@ -283,6 +366,8 @@ const updateDespacho = async (req, res) => {
         }
 
         const estabaCerrado = Number(existente.estado) === 2;
+        const cambiaTransporte =
+            Number(id_transporte) !== Number(existente.id_transporte);
 
         // El middleware validarMotivo se encadena solo en la ruta de
         // corrección; aquí se verifica por si se llamó al PUT normal sobre
@@ -293,12 +378,28 @@ const updateDespacho = async (req, res) => {
             });
         }
 
+        // Un despacho cerrado salió con una caja inspeccionada: cambiar el
+        // transporte dejaría esa inspección ligada a otra unidad. La BD lo
+        // rechaza (trg_validar_cierre); aquí se responde claro.
+        if (estabaCerrado && cambiaTransporte) {
+            return res.status(409).json({
+                error: "No se puede cambiar el transporte de un despacho cerrado. Reabre primero el despacho (admin) y vuelve a registrar la inspección."
+            });
+        }
+
+        if (cambiaTransporte) {
+            const validacion = await validarTransporteParaDespacho(id_transporte);
+            if (validacion.error) {
+                return res.status(validacion.status).json({ error: validacion.error });
+            }
+        }
+
         await despachosModel.updateDespacho(id, req.body);
         const completo = await despachosModel.getDespachoById(id);
 
         // ---- Auditoría de la corrección ----
         if (estabaCerrado) {
-            // Snapshot legible de lo que cambió: 'Placas: 15AN7H → 15AN8J'.
+            // Snapshot legible de lo que cambió: 'Cita: A123 → A124'.
             // Guardar el JSON completo sería más fiel pero ilegible para
             // quien audite meses después.
             const campos = [
@@ -330,15 +431,112 @@ const updateDespacho = async (req, res) => {
             });
         }
 
+        const avisos = [];
+        if (cambiaTransporte && existente.inocuidad !== null) {
+            avisos.push(
+                `Cambió el transporte: la inspección anterior se borró. Registra la inocuidad de la caja ${completo.placas_caja} antes de cerrar.`
+            );
+        }
+
         res.status(200).json({
             mensaje: estabaCerrado
                 ? "Corrección registrada en la auditoría del despacho"
                 : "Despacho actualizado",
-            despacho: completo
+            despacho: completo,
+            avisos
         });
     } catch (error) {
         console.error("Error al actualizar el despacho:", error);
+
+        if (responderErrorBD(res, error)) return;
+
         res.status(500).json({ error: "Error al actualizar el despacho" });
+    }
+};
+
+// ----------------------------------------------------------------------------
+// PATCH /api/preenfrio/despachos/:id/inocuidad
+// ----------------------------------------------------------------------------
+// Registra la inspección de la caja para ESTE despacho. Es la decisión que
+// el supervisor toma en el andén con la unidad enfrente.
+//
+//   · Solo en borrador: un despacho cerrado ya salió con la inspección que
+//     tenía. Para cambiarla hay que reabrirlo (admin, auditado).
+//   · El usuario es el de la sesión; la fecha la pone la BD.
+//   · Se puede volver a inspeccionar: un rechazo se corrige lavando la caja
+//     y registrando una nueva revisión.
+const registrarInocuidad = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { inocuidad, inocuidad_observaciones } = req.body;
+
+        if (!req.id_usuario) {
+            return res.status(401).json({
+                error: "No se pudo identificar al usuario de la sesión"
+            });
+        }
+
+        const despacho = await despachosModel.getDespachoById(id);
+
+        if (!despacho) {
+            return res.status(404).json({ error: "Despacho no encontrado" });
+        }
+
+        const problema = await validarAlcanceDespacho(id, req.camaras);
+        if (problema) {
+            return res.status(problema.status).json({ error: problema.error });
+        }
+
+        if (Number(despacho.estado) === 2) {
+            return res.status(409).json({
+                error: `El despacho ${despacho.folio_despacho} ya está cerrado: su inspección no se modifica. Reábrelo primero si fue un error.`
+            });
+        }
+
+        // La BD exige los cuatro catálogos del transporte para registrar
+        // la inspección. Se revisa antes para dar un mensaje útil.
+        const transporte = await transportesModel.getTransporteById(
+            despacho.id_transporte
+        );
+        if (!transporte || !transporte.catalogos_completos) {
+            return res.status(409).json({
+                error: "El transporte de este despacho no tiene sus cuatro catálogos (línea, operador, tracto y caja). Cambia el servicio antes de inspeccionar."
+            });
+        }
+
+        const actualizado = await despachosModel.registrarInocuidad(id, {
+            inocuidad,
+            id_usuario: req.id_usuario,
+            observaciones: inocuidad_observaciones
+        });
+
+        // Se cerró entre la lectura y el UPDATE
+        if (!actualizado) {
+            return res.status(409).json({
+                error: "El despacho ya no está en borrador: no se registró la inspección"
+            });
+        }
+
+        const completo = await despachosModel.getDespachoById(id);
+
+        res.status(200).json({
+            mensaje: inocuidad === 1
+                ? `Inocuidad APROBADA para la caja ${completo.placas_caja}: el despacho ${completo.folio_despacho} puede cerrarse`
+                : `Inocuidad RECHAZADA para la caja ${completo.placas_caja}: no debe cargar fruta. Cambia de unidad o vuelve a inspeccionar.`,
+            despacho: completo
+        });
+    } catch (error) {
+        console.error("Error al registrar la inocuidad:", error);
+
+        if (responderErrorBD(res, error)) return;
+
+        if (error.code === "23503") {
+            return res.status(409).json({
+                error: "El usuario de la sesión no existe en la BD"
+            });
+        }
+
+        res.status(500).json({ error: "Error al registrar la inspección de inocuidad" });
     }
 };
 
@@ -403,9 +601,8 @@ const agregarLinea = async (req, res) => {
         }
 
         // ---- No se puede subir más de lo que hay ----
-        // El trigger del movimiento usa GREATEST(cantidad - movida, 0), así
-        // que un exceso NO reventaría: dejaría la cámara en cero y el
-        // documento diría que salieron tarimas que no existían.
+        // La BD también lo rechaza, pero aquí se responde con el nombre de
+        // la cámara y el saldo exacto del lote.
         if (Number(cantidad_tarimas) > Number(origen.cantidad_tarimas)) {
             return res.status(409).json({
                 error: `No puedes despachar ${cantidad_tarimas} tarimas: en "${origen.nombre_camara}" solo hay ${origen.cantidad_tarimas} de este lote.`
@@ -447,6 +644,16 @@ const agregarLinea = async (req, res) => {
             );
         }
 
+        // Cargar antes de inspeccionar es posible, pero el cierre lo va a
+        // bloquear: se recuerda desde la primera línea.
+        if (Number(despachoActualizado.inocuidad) !== 1) {
+            avisos.push(
+                despachoActualizado.inocuidad === null
+                    ? "Inspección de inocuidad PENDIENTE: regístrala antes de cerrar."
+                    : "⚠️ La inspección de inocuidad de esta caja está RECHAZADA: no podrás cerrar el despacho."
+            );
+        }
+
         res.status(201).json({
             mensaje: `Se agregaron ${cantidad_tarimas} tarimas al despacho ${despacho.folio_despacho}`,
             linea: completa,
@@ -466,6 +673,8 @@ const agregarLinea = async (req, res) => {
         });
     } catch (error) {
         console.error("Error al agregar la linea:", error);
+
+        if (responderErrorBD(res, error)) return;
 
         if (error.code === "23503") {
             return res.status(409).json({
@@ -544,6 +753,9 @@ const quitarLinea = async (req, res) => {
         });
     } catch (error) {
         console.error("Error al quitar la linea:", error);
+
+        if (responderErrorBD(res, error)) return;
+
         res.status(500).json({ error: "Error al quitar la línea" });
     }
 };
@@ -581,14 +793,18 @@ const cerrarDespacho = async (req, res) => {
             });
         }
 
-        // ---- Inocuidad: el bloqueo duro que se anunció en el bloque 4 ----
-        const transporte = await transportesModel.getTransporteById(
-            despacho.id_transporte
-        );
-
-        if (transporte && Number(transporte.inocuidad) === 0) {
+        // ---- Inocuidad DEL DESPACHO: bloqueo duro ----
+        // Ya no se consulta transportes.inocuidad: cada despacho exige su
+        // propia inspección aprobada.
+        if (despacho.inocuidad === null) {
             return res.status(409).json({
-                error: `La unidad ${transporte.placas_caja} tiene la INOCUIDAD RECHAZADA: no puede transportar fruta. Apruébala en el catálogo de transportes o cambia de unidad.`
+                error: `La inspección de inocuidad de la caja ${despacho.placas_caja} está PENDIENTE. Regístrala antes de cerrar.`
+            });
+        }
+
+        if (Number(despacho.inocuidad) !== 1) {
+            return res.status(409).json({
+                error: `La caja ${despacho.placas_caja} tiene la INOCUIDAD RECHAZADA en este despacho: no puede transportar fruta. Cambia de unidad o vuelve a inspeccionar.`
             });
         }
 
@@ -597,34 +813,40 @@ const cerrarDespacho = async (req, res) => {
         // clientes es legítimo, pero mandar el camión sin que nadie lo haya
         // notado es lo que cuesta el rechazo en el andén.
         const descuadres = await despachosModel.getLineasDeOtroCliente(id);
+        const confirmado = req.query.confirmar === "1";
 
-        if (descuadres.length > 0 && req.query.confirmar !== "1") {
+        if (descuadres.length > 0 && !confirmado) {
             return res.status(409).json({
                 error: `Este despacho lleva ${descuadres.length} línea(s) de fruta planeada para otro cliente. Revísalas y vuelve a cerrar con ?confirmar=1 si la reasignación es correcta.`,
                 lineas_de_otro_cliente: descuadres
             });
         }
 
-        await despachosModel.cerrarDespacho(id);
-        const completo = await despachosModel.getDespachoById(id);
-
+        // El cierre y su auditoría van en UNA transacción, y la
+        // confirmación de reasignación viaja a la BD con
+        // app.confirmar_reasignacion (la exige trg_validar_cierre).
+        //
         // Si se cerró con reasignación, queda constancia en la auditoría:
         // es exactamente el dato que alguien va a buscar si el CEDIS
         // rechaza la carga.
-        if (descuadres.length > 0) {
-            await despachosModel.registrarAuditoria({
-                id_despacho: id,
-                estado_al_editar: 1,
-                motivo: "Cierre confirmado con fruta reasignada de otro cliente",
-                cambios: descuadres
-                    .map(
-                        (d) =>
-                            `Lote ${d.codigo_lote}: planeado para ${d.cliente_fruta} → despachado a ${d.cliente_despacho}`
-                    )
-                    .join("; "),
-                id_usuario: req.id_usuario
-            });
-        }
+        await despachosModel.cerrarDespacho(id, {
+            confirmarReasignacion: descuadres.length > 0 && confirmado,
+            auditoria: descuadres.length > 0
+                ? {
+                    estado_al_editar: 1,
+                    motivo: "Cierre confirmado con fruta reasignada de otro cliente",
+                    cambios: descuadres
+                        .map(
+                            (d) =>
+                                `Lote ${d.codigo_lote}: planeado para ${d.cliente_fruta} → despachado a ${d.cliente_despacho}`
+                        )
+                        .join("; "),
+                    id_usuario: req.id_usuario
+                }
+                : null
+        });
+
+        const completo = await despachosModel.getDespachoById(id);
 
         res.status(200).json({
             mensaje: `Despacho ${completo.folio_despacho} cerrado: ${completo.cantidad_tarimas} tarimas y ${completo.cantidad_cajas} cajas salieron a ${completo.cliente} - ${completo.cedis}`,
@@ -632,6 +854,9 @@ const cerrarDespacho = async (req, res) => {
         });
     } catch (error) {
         console.error("Error al cerrar el despacho:", error);
+
+        if (responderErrorBD(res, error)) return;
+
         res.status(500).json({ error: "Error al cerrar el despacho" });
     }
 };
@@ -641,6 +866,9 @@ const cerrarDespacho = async (req, res) => {
 // ----------------------------------------------------------------------------
 // Solo admin, y siempre con motivo: reabrir significa que el documento se
 // cerró por error. Queda registrado en la auditoría.
+//
+// La inspección se conserva al reabrir. Si se cambia el transporte del
+// borrador reabierto, la BD la borra y hay que volver a inspeccionar.
 const reabrirDespacho = async (req, res) => {
     try {
         const { id } = req.params;
@@ -676,6 +904,9 @@ const reabrirDespacho = async (req, res) => {
         });
     } catch (error) {
         console.error("Error al reabrir el despacho:", error);
+
+        if (responderErrorBD(res, error)) return;
+
         res.status(500).json({ error: "Error al reabrir el despacho" });
     }
 };
@@ -721,6 +952,8 @@ const deleteDespacho = async (req, res) => {
     } catch (error) {
         console.error("Error al eliminar el despacho:", error);
 
+        if (responderErrorBD(res, error)) return;
+
         if (error.code === "23503") {
             return res.status(409).json({
                 error: "No se puede eliminar: el despacho tiene registros asociados"
@@ -748,6 +981,7 @@ const getAuditoria = async (req, res) => {
         }
 
         const auditoria = await despachosModel.getAuditoria(id);
+
         res.status(200).json(auditoria);
     } catch (error) {
         console.error("Error al obtener la auditoria:", error);
@@ -762,6 +996,7 @@ export const despachosController = {
     getDisponible,
     createDespacho,
     updateDespacho,
+    registrarInocuidad,
     agregarLinea,
     quitarLinea,
     cerrarDespacho,

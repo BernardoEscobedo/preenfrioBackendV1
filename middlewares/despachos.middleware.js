@@ -1,9 +1,10 @@
 // ============================================================================
 // VALIDACIONES DE DESPACHOS
 // ============================================================================
-// Aquí se valida el FORMATO del documento y del picking. Lo que exige
-// consultar la BD —que el transporte esté aprobado, que la ocupación tenga
-// fruta suficiente, que el despacho siga en borrador— vive en el controller.
+// Aquí se valida el FORMATO del documento, del picking y de la inspección.
+// Lo que exige consultar la BD —que el transporte esté completo y activo,
+// que la ocupación tenga fruta suficiente, que el despacho siga en
+// borrador— vive en el controller.
 // ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -44,7 +45,6 @@ export const validarDespacho = (req, res, next) => {
     }
 
     const fecha = new Date(fecha_despacho);
-
     if (isNaN(fecha.getTime())) {
         return res.status(400).json({
             error: 'El campo "fecha_despacho" no es una fecha válida (usa AAAA-MM-DD)'
@@ -67,7 +67,6 @@ export const validarDespacho = (req, res, next) => {
     // Opcional al crear el borrador: cuando se arma el picking todavía no
     // se sabe a qué hora sale el camión.
     let horaNorm = null;
-
     if (hora_salida) {
         if (!/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(String(hora_salida))) {
             return res.status(400).json({
@@ -81,10 +80,8 @@ export const validarDespacho = (req, res, next) => {
     // Se hereda de la producción, pero se puede ajustar: las citas se
     // reprograman.
     let fechaCitaNorm = null;
-
     if (fecha_cita) {
         const fc = new Date(fecha_cita);
-
         if (isNaN(fc.getTime())) {
             return res.status(400).json({
                 error: 'El campo "fecha_cita" no es una fecha válida (usa AAAA-MM-DD)'
@@ -97,7 +94,6 @@ export const validarDespacho = (req, res, next) => {
                 error: "La fecha de cita no puede ser anterior a la fecha de despacho"
             });
         }
-
         fechaCitaNorm = fecha_cita;
     }
 
@@ -105,20 +101,17 @@ export const validarDespacho = (req, res, next) => {
     // El dato que respalda la cadena de frío ante el cliente. Mismo rango
     // que en recepciones y movimientos.
     let tempNum = null;
-
     if (
         temperatura_salida !== undefined &&
         temperatura_salida !== null &&
         temperatura_salida !== ""
     ) {
         tempNum = Number(temperatura_salida);
-
         if (isNaN(tempNum)) {
             return res.status(400).json({
                 error: 'El campo "temperatura_salida" debe ser numérico'
             });
         }
-
         if (tempNum < -5 || tempNum > 45) {
             return res.status(400).json({
                 error: 'El campo "temperatura_salida" está fuera de rango (-5 a 45 °C)'
@@ -157,6 +150,61 @@ export const validarDespacho = (req, res, next) => {
     req.body.cita = cita ? String(cita).trim().toUpperCase() : null;
     req.body.observaciones = observaciones ? String(observaciones).trim() : null;
 
+    // La inspección NO se captura en el encabezado: tiene su propio
+    // endpoint. Se descarta para que el PUT no pueda aprobarla de paso.
+    delete req.body.inocuidad;
+    delete req.body.inocuidad_fecha;
+    delete req.body.inocuidad_id_usuario;
+    delete req.body.inocuidad_observaciones;
+
+    next();
+};
+
+// ----------------------------------------------------------------------------
+// Inspección de inocuidad del despacho
+// ----------------------------------------------------------------------------
+// Resultado de revisar la caja en el andén ANTES de cargar: limpieza,
+// olores, plagas y estado de la unidad.
+//   1 = aprobada · 0 = rechazada
+//
+// ⚠️ NO hay valor por defecto. El middleware anterior de transportes
+// asumía 1 si el campo no venía: omitir el dato aprobaba la unidad. Aquí
+// una inspección no capturada es un 400, nunca una aprobación.
+//
+// El usuario y la fecha NO se reciben del body: el usuario sale de la
+// sesión (req.id_usuario) y la fecha la pone la BD.
+export const validarInocuidadDespacho = (req, res, next) => {
+    const { inocuidad, inocuidad_observaciones } = req.body;
+
+    if (inocuidad === undefined || inocuidad === null || inocuidad === "") {
+        return res.status(400).json({
+            error: 'El campo "inocuidad" es obligatorio: 1 (aprobada) o 0 (rechazada)'
+        });
+    }
+
+    const inocuidadNum = Number(inocuidad);
+    if (![0, 1].includes(inocuidadNum)) {
+        return res.status(400).json({
+            error: 'El campo "inocuidad" debe ser 1 (aprobada) o 0 (rechazada)'
+        });
+    }
+
+    if (
+        inocuidad_observaciones !== undefined &&
+        inocuidad_observaciones !== null &&
+        String(inocuidad_observaciones).length > 500
+    ) {
+        return res.status(400).json({
+            error: 'El campo "inocuidad_observaciones" no puede exceder 500 caracteres'
+        });
+    }
+
+    req.body.inocuidad = inocuidadNum;
+    req.body.inocuidad_observaciones =
+        inocuidad_observaciones && String(inocuidad_observaciones).trim() !== ""
+            ? String(inocuidad_observaciones).trim()
+            : null;
+
     next();
 };
 
@@ -186,7 +234,6 @@ export const validarLinea = (req, res, next) => {
     // ---- Bloque físico ----
     // Opcional: no toda la fruta se maneja en bloques armados.
     let bloqueNum = null;
-
     if (id_bloque !== undefined && id_bloque !== null && id_bloque !== "") {
         if (isNaN(Number(id_bloque))) {
             return res.status(400).json({
@@ -240,16 +287,13 @@ export const validarLinea = (req, res, next) => {
 
     // ---- Temperatura de la línea ----
     let tempNum = null;
-
     if (temperatura !== undefined && temperatura !== null && temperatura !== "") {
         tempNum = Number(temperatura);
-
         if (isNaN(tempNum)) {
             return res.status(400).json({
                 error: 'El campo "temperatura" debe ser numérico'
             });
         }
-
         if (tempNum < -5 || tempNum > 45) {
             return res.status(400).json({
                 error: 'El campo "temperatura" está fuera de rango (-5 a 45 °C)'
@@ -302,7 +346,6 @@ export const validarMotivo = (req, res, next) => {
     }
 
     req.body.motivo = motivo.trim();
-
     next();
 };
 
