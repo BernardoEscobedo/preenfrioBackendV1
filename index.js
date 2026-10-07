@@ -55,7 +55,7 @@ import mantenimientosRouter from "./routes/mantenimientos.route.js";
 // ---- v3.0 · Evidencias en SharePoint y bajas con historial ----
 import evidenciasRouter from "./routes/evidencias.route.js";
 import bajasRouter from "./routes/bajas.route.js";
-
+import produccionImportacionRouter from "./routes/produccionImportacion.route.js";
 // ============================================================================
 // VERIFICACIÓN DE ARRANQUE
 // ============================================================================
@@ -140,6 +140,7 @@ app.use(`${API}/despachos`, despachosRouter);
 app.use(`${API}/bloques`, bloquesRouter);
 app.use(`${API}/pulpeos`, pulpeosRouter);
 app.use(`${API}/mantenimientos`, mantenimientosRouter);
+app.use(`${API}/produccion-importacion`, produccionImportacionRouter);
 
 // ---- v3.0 ----
 // Fotos y videos de despachos y pulpeos, almacenados en SharePoint
