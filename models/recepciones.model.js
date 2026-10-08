@@ -36,6 +36,13 @@ import { db } from "../database/connection.database.js";
 //   fn_tarimas_disponibles y lo guarda. Si viene con número, se respeta: el
 //   operador vio el patio y decidió.
 //
+// CONFIRMACIÓN Y ALERTAS (recepciones_cierres)
+//   El operativo marca cada línea como COMPLETA o NO LLEGÓ. El trigger
+//   trg_cierre_recepcion calcula plan contra recibido y deja la alerta al
+//   coordinador si hay CUALQUIER diferencia (sin tolerancia). Una línea
+//   completa no admite más recepciones hasta que el coordinador la reabra
+//   (trg_proteger_linea_cerrada).
+//
 // ALCANCE POR CÁMARA
 //   Los modelos reciben req.camaras y filtran por r.id_camara: la cámara
 //   donde se recibió de verdad, que puede diferir de la planeada.
@@ -148,24 +155,62 @@ const getRecepcionById = async (id_recepcion) => {
 // ----------------------------------------------------------------------------
 // Qué espera recibir el preenfrío
 // ----------------------------------------------------------------------------
-// Usa vw_recepciones_esperadas, que ya cruza el plan contra lo recibido y
-// calcula el pendiente. Se consulta la vista en vez de rearmar el JOIN aquí
-// para que el dashboard y este módulo no calculen distinto.
+// Parte de vw_recepciones_esperadas (plan contra recibido) y le agrega el
+// estado de la confirmación:
 //
-// solo_pendientes: oculta lo que ya llegó completo. Es lo que quiere ver el
-// andén; el listado completo sirve para revisar la semana.
+//   estado_recepcion
+//     'pendiente'  no ha llegado nada
+//     'no_llego'   el operativo marcó que no llegó (sigue abierta)
+//     'parcial'    ya llegó algo, falta confirmar
+//     'completa'   confirmada como completa (cerrada)
+//
+// Solo producción CON cámara asignada: lo que el coordinador no asignó no
+// pasa por preenfrío y no se espera en el andén.
+//
+// solo_pendientes: oculta las líneas confirmadas. Antes se filtraba por
+// tarimas_pendientes > 0, que escondía las líneas a granel (0 tarimas) y
+// las que llegaron de más.
 const getEsperadas = async (
     { semana = null, solo_pendientes = true, id_camara = null } = {},
     camaras = null
 ) => {
     const result = await db.query(
         `
-        SELECT * FROM vw_recepciones_esperadas
-        WHERE ($1::INT IS NULL OR semana = $1)
-          AND ($2::INT IS NULL OR id_camara = $2)
-          AND ($3::INT[] IS NULL OR id_camara = ANY($3))
-          AND ($4::BOOLEAN IS FALSE OR tarimas_pendientes > 0)
-        ORDER BY fecha_entrega NULLS LAST, fecha_empaque
+        SELECT
+            v.*,
+            c.id_cierre,
+            c.fecha_hora          AS fecha_hora_cierre,
+            c.diferencia_cajas    AS diferencia_cajas_cierre,
+            c.diferencia_tarimas  AS diferencia_tarimas_cierre,
+            c.alerta_estado,
+            COALESCE(nl.veces, 0) AS veces_no_llego,
+            nl.ultima             AS ultimo_no_llego,
+            COALESCE(rc.viajes, 0) AS recepciones,
+            CASE
+                WHEN c.id_cierre IS NOT NULL                          THEN 'completa'
+                WHEN v.cajas_recibidas > 0 OR v.tarimas_recibidas > 0 THEN 'parcial'
+                WHEN nl.veces > 0                                     THEN 'no_llego'
+                ELSE 'pendiente'
+            END AS estado_recepcion
+        FROM vw_recepciones_esperadas v
+        LEFT JOIN recepciones_cierres c
+               ON c.id_produccion = v.id_produccion AND c.tipo_cierre = 1 AND c.vigente
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*)::INT AS veces, MAX(fecha_cierre) AS ultima
+            FROM recepciones_cierres
+            WHERE id_produccion = v.id_produccion AND tipo_cierre = 2
+        ) nl ON true
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*)::INT AS viajes
+            FROM recepciones
+            WHERE id_produccion = v.id_produccion AND estado = 1
+        ) rc ON true
+        WHERE v.id_camara IS NOT NULL
+          AND ($1::INT IS NULL OR v.semana = $1)
+          AND ($2::INT IS NULL OR v.id_camara = $2)
+          AND ($3::INT[] IS NULL OR v.id_camara = ANY($3))
+          AND ($4::BOOLEAN IS FALSE OR c.id_cierre IS NULL)
+        ORDER BY v.fecha_empaque, v.codigo_lote, v.codigo_sku, v.id_produccion
         `,
         [semana, id_camara, camaras, solo_pendientes]
     );
@@ -182,20 +227,26 @@ const getEsperadas = async (
 // guarda. cajas_ingresadas se acepta por contrato con el frontend, pero el
 // trigger reparte las cajas en proporción a las tarimas y sobrescribe el
 // valor.
-const createRecepcion = async ({
-    id_produccion,
-    id_camara,
-    fecha_recepcion,
-    hora_recepcion,
-    cajas_recibidas,
-    tarimas_recibidas,
-    tarimas_ingresadas,
-    cajas_ingresadas,
-    temperatura,
-    id_usuario,
-    observaciones
-}) => {
-    const result = await db.query(
+//
+// Recibe el ejecutor (db o un cliente de transacción) para que la
+// recepción por lote inserte varias líneas en una sola transacción.
+const createRecepcion = async (
+    {
+        id_produccion,
+        id_camara,
+        fecha_recepcion,
+        hora_recepcion,
+        cajas_recibidas,
+        tarimas_recibidas,
+        tarimas_ingresadas,
+        cajas_ingresadas,
+        temperatura,
+        id_usuario,
+        observaciones
+    },
+    ejecutor = db
+) => {
+    const result = await ejecutor.query(
         `
         INSERT INTO recepciones (
             id_produccion, id_camara, fecha_recepcion, hora_recepcion,
@@ -213,8 +264,8 @@ const createRecepcion = async ({
             hora_recepcion,
             cajas_recibidas,
             tarimas_recibidas,
-            tarimas_ingresadas,
-            cajas_ingresadas,
+            tarimas_ingresadas ?? null,
+            cajas_ingresadas ?? null,
             temperatura,
             id_usuario,
             observaciones
@@ -259,9 +310,8 @@ const updateRecepcion = async (
 //     recepción metió y cierra su fila de cola
 //   · trg_actualizar_estado_produccion recalcula el estado de la producción
 //
-// Si parte de esa fruta ya se movió a conservación o se despachó, la cámara
-// solo descuenta lo que todavía tiene (el trigger corta con GREATEST para no
-// quedar en negativo). El controller compara antes y después para avisarlo.
+// Si la línea ya se confirmó como completa, trg_proteger_linea_cerrada lo
+// rechaza: hay que reabrirla primero.
 const cancelarRecepcion = async (id_recepcion) => {
     const result = await db.query(
         `
@@ -335,8 +385,8 @@ const getOcupacionesGeneradas = async (id_recepcion) => {
 // ⚠️ Para comparar antes/después usa tarimas_ocupadas, no
 // tarimas_disponibles: la segunda sale de fn_tarimas_disponibles, que nunca
 // baja de 0 y vale 0 en mantenimiento.
-const getDisponibilidad = async (id_camara) => {
-    const result = await db.query(
+const getDisponibilidad = async (id_camara, ejecutor = db) => {
+    const result = await ejecutor.query(
         `
         SELECT
             c.id_camara,
@@ -364,6 +414,219 @@ const getDisponibilidad = async (id_camara) => {
     return result.rows[0];
 };
 
+// ============================================================================
+// RECEPCIÓN POR LOTE Y CONFIRMACIÓN
+// ============================================================================
+
+// Líneas a recibir, bloqueadas para que dos operativos no capturen la misma
+// a la vez. Trae lo ya recibido y si hay una confirmación vigente.
+const getLineasParaRecibir = async (ejecutor, ids) => {
+    const result = await ejecutor.query(
+        `
+        SELECT
+            p.id_produccion,
+            p.codigo_lote,
+            p.estado,
+            p.id_camara,
+            p.cajas_procesadas  AS cajas_planeadas,
+            p.estiba_pallets    AS tarimas_planeadas,
+            s.codigo_sku,
+            cam.nombre_camara,
+            COALESCE((SELECT SUM(r.cajas_recibidas) FROM recepciones r
+                      WHERE r.id_produccion = p.id_produccion AND r.estado = 1), 0)::INT
+                                AS cajas_recibidas,
+            COALESCE((SELECT SUM(r.tarimas_recibidas) FROM recepciones r
+                      WHERE r.id_produccion = p.id_produccion AND r.estado = 1), 0)::INT
+                                AS tarimas_recibidas,
+            (SELECT c.id_cierre FROM recepciones_cierres c
+              WHERE c.id_produccion = p.id_produccion AND c.tipo_cierre = 1 AND c.vigente)
+                                AS id_cierre_vigente
+        FROM produccion p
+        JOIN sku_pt s        ON s.id_sku      = p.id_sku
+        LEFT JOIN camaras cam ON cam.id_camara = p.id_camara
+        WHERE p.id_produccion = ANY($1::INT[])
+        FOR UPDATE OF p
+        `,
+        [ids]
+    );
+    return result.rows;
+};
+
+// Recepciones recién insertadas, ya con lo que escribió el trigger
+// (tarimas_ingresadas). Se lee dentro de la misma transacción.
+const getResultadoRecepciones = async (ejecutor, ids) => {
+    if (ids.length === 0) return [];
+    const result = await ejecutor.query(
+        `
+        SELECT r.id_recepcion, r.id_produccion, r.id_camara,
+               r.tarimas_recibidas, r.cajas_recibidas,
+               COALESCE(r.tarimas_ingresadas, r.tarimas_recibidas) AS tarimas_ingresadas,
+               GREATEST(r.tarimas_recibidas - COALESCE(r.tarimas_ingresadas, r.tarimas_recibidas), 0)
+                   AS tarimas_en_cola,
+               cam.nombre_camara
+        FROM recepciones r
+        LEFT JOIN camaras cam ON cam.id_camara = r.id_camara
+        WHERE r.id_recepcion = ANY($1::INT[])
+        `,
+        [ids]
+    );
+    return result.rows;
+};
+
+// Confirmación COMPLETA. Plan, recibido y alerta los calcula el trigger.
+const confirmarCompleta = async (ejecutor, { id_produccion, fecha_cierre, id_camara, observaciones, id_usuario }) => {
+    const result = await ejecutor.query(
+        `
+        INSERT INTO recepciones_cierres (
+            id_produccion, tipo_cierre, fecha_cierre, id_camara, observaciones, id_usuario
+        )
+        VALUES ($1, 1, $2, $3, $4, $5)
+        RETURNING *
+        `,
+        [id_produccion, fecha_cierre, id_camara, observaciones, id_usuario]
+    );
+    return result.rows[0];
+};
+
+// "No llegó": la línea sigue abierta (puede llegar al día siguiente).
+// Solo uno por línea y por día: repetirlo el mismo día no duplica la alerta.
+const marcarNoLlego = async (ejecutor, { id_produccion, fecha_cierre, id_camara, observaciones, id_usuario }) => {
+    const result = await ejecutor.query(
+        `
+        INSERT INTO recepciones_cierres (
+            id_produccion, tipo_cierre, fecha_cierre, id_camara, observaciones, id_usuario
+        )
+        VALUES ($1, 2, $2, $3, $4, $5)
+        ON CONFLICT (id_produccion, fecha_cierre) WHERE tipo_cierre = 2 DO NOTHING
+        RETURNING *
+        `,
+        [id_produccion, fecha_cierre, id_camara, observaciones, id_usuario]
+    );
+    return result.rows[0];
+};
+
+// ============================================================================
+// ALERTAS PARA EL COORDINADOR
+// ============================================================================
+const SELECT_ALERTA = `
+    SELECT
+        c.*,
+        CASE c.tipo_cierre WHEN 1 THEN 'DIFERENCIA' ELSE 'NO_LLEGO' END AS tipo_alerta,
+        CASE c.alerta_estado WHEN 1 THEN 'Pendiente' WHEN 2 THEN 'Atendida' ELSE 'Sin alerta' END
+                              AS alerta_estado_texto,
+        p.codigo_lote,
+        p.semana,
+        p.fecha_empaque,
+        p.fecha_entrega,
+        p.region,
+        p.comentarios         AS comentarios_produccion,
+        f.codigo_finca,
+        f.nombre              AS nombre_finca,
+        pr.codigo_productor,
+        pr.nombre             AS nombre_productor,
+        s.codigo_sku,
+        s.calidad             AS calidad_sku,
+        cc.cliente,
+        cc.cedis,
+        cc.acronimo           AS acronimo_cc,
+        COALESCE(c.id_camara, p.id_camara) AS id_camara_alerta,
+        cam.nombre_camara,
+        u.usuario             AS usuario_registro,
+        e.nombre              AS nombre_registro,
+        e.apellidos           AS apellidos_registro,
+        ua.usuario            AS usuario_atencion,
+        ea.nombre             AS nombre_atencion,
+        ea.apellidos          AS apellidos_atencion
+    FROM recepciones_cierres c
+    JOIN produccion    p   ON p.id_produccion = c.id_produccion
+    JOIN fincas        f   ON f.id_finca      = p.id_finca
+    JOIN productores   pr  ON pr.id_productor = p.id_productor
+    JOIN sku_pt        s   ON s.id_sku        = p.id_sku
+    JOIN cedis_cliente cc  ON cc.id_cc        = p.id_cc
+    LEFT JOIN camaras  cam ON cam.id_camara   = COALESCE(c.id_camara, p.id_camara)
+    LEFT JOIN usuarios u   ON u.id_usuario    = c.id_usuario
+    LEFT JOIN empleados e  ON e.id_empleado   = u.id_empleado
+    LEFT JOIN usuarios ua  ON ua.id_usuario   = c.alerta_atendida_por
+    LEFT JOIN empleados ea ON ea.id_empleado  = ua.id_empleado
+`;
+
+// estado: 1 pendientes · 2 atendidas · null ambas
+const getAlertas = async ({ estado = null } = {}, camaras = null) => {
+    const result = await db.query(
+        `
+        ${SELECT_ALERTA}
+        WHERE c.alerta_estado <> 0
+          AND ($1::INT IS NULL OR c.alerta_estado = $1)
+          AND ($2::INT[] IS NULL OR COALESCE(c.id_camara, p.id_camara) = ANY($2))
+        ORDER BY c.alerta_estado, c.fecha_hora DESC
+        LIMIT 500
+        `,
+        [estado, camaras]
+    );
+    return result.rows;
+};
+
+const getResumenAlertas = async (camaras = null) => {
+    const result = await db.query(
+        `
+        SELECT
+            COUNT(*) FILTER (WHERE c.alerta_estado = 1)::INT                     AS pendientes,
+            COUNT(*) FILTER (WHERE c.alerta_estado = 1 AND c.tipo_cierre = 1)::INT AS diferencias,
+            COUNT(*) FILTER (WHERE c.alerta_estado = 1 AND c.tipo_cierre = 2)::INT AS no_llego
+        FROM recepciones_cierres c
+        JOIN produccion p ON p.id_produccion = c.id_produccion
+        WHERE ($1::INT[] IS NULL OR COALESCE(c.id_camara, p.id_camara) = ANY($1))
+        `,
+        [camaras]
+    );
+    return result.rows[0];
+};
+
+const getCierreById = async (id_cierre) => {
+    const result = await db.query(`${SELECT_ALERTA} WHERE c.id_cierre = $1`, [id_cierre]);
+    return result.rows[0];
+};
+
+// Devuelve undefined si ya estaba atendida (otro coordinador se adelantó)
+const atenderAlerta = async (id_cierre, { comentario, id_usuario }) => {
+    const result = await db.query(
+        `
+        UPDATE recepciones_cierres
+        SET alerta_estado = 2,
+            alerta_atendida_por = $2,
+            alerta_fecha_atencion = CURRENT_TIMESTAMP,
+            alerta_comentario = $3
+        WHERE id_cierre = $1 AND alerta_estado = 1
+        RETURNING id_cierre
+        `,
+        [id_cierre, id_usuario, comentario]
+    );
+    return result.rows[0];
+};
+
+// Reabrir una línea confirmada: vuelve a aceptar recepciones. Si su alerta
+// seguía pendiente, se da por atendida con el motivo de la reapertura: es
+// la acción que tomó el coordinador sobre esa diferencia.
+const reabrirCierre = async (id_cierre, { motivo, id_usuario }) => {
+    const result = await db.query(
+        `
+        UPDATE recepciones_cierres
+        SET vigente = false,
+            reabierto_por = $2,
+            fecha_reapertura = CURRENT_TIMESTAMP,
+            motivo_reapertura = $3,
+            alerta_estado = CASE WHEN alerta_estado = 1 THEN 2 ELSE alerta_estado END,
+            alerta_atendida_por = CASE WHEN alerta_estado = 1 THEN $2 ELSE alerta_atendida_por END,
+            alerta_fecha_atencion = CASE WHEN alerta_estado = 1 THEN CURRENT_TIMESTAMP ELSE alerta_fecha_atencion END,
+            alerta_comentario = CASE WHEN alerta_estado = 1 THEN 'Línea reabierta: ' || $3 ELSE alerta_comentario END
+        WHERE id_cierre = $1 AND tipo_cierre = 1 AND vigente
+        RETURNING id_cierre
+        `,
+        [id_cierre, id_usuario, motivo]
+    );
+    return result.rows[0];
+};
+
 const recepcionesModel = {
     getRecepciones,
     getRecepcionById,
@@ -373,7 +636,16 @@ const recepcionesModel = {
     cancelarRecepcion,
     reactivarRecepcion,
     getOcupacionesGeneradas,
-    getDisponibilidad
+    getDisponibilidad,
+    getLineasParaRecibir,
+    getResultadoRecepciones,
+    confirmarCompleta,
+    marcarNoLlego,
+    getAlertas,
+    getResumenAlertas,
+    getCierreById,
+    atenderAlerta,
+    reabrirCierre
 };
 
 export default recepcionesModel;

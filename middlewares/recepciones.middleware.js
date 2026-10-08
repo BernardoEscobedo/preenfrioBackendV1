@@ -24,6 +24,26 @@ import { aFechaISO, esFechaFutura } from "../utils/fechas.js";
 /** true si el valor es un entero >= 0 */
 const esEnteroNoNegativo = (n) => Number.isInteger(n) && n >= 0;
 
+const PATRON_HORA = /^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/;
+
+/** Temperatura opcional. Devuelve { valor } o { error }. */
+const leerTemperatura = (temperatura) => {
+    if (temperatura === undefined || temperatura === null || temperatura === "") return { valor: null };
+    const n = Number(temperatura);
+    if (isNaN(n)) return { error: 'El campo "temperatura" debe ser numérico' };
+    if (n < -5 || n > 45) return { error: 'El campo "temperatura" está fuera de rango (-5 a 45 °C). Revisa la lectura.' };
+    return { valor: n };
+};
+
+/** Coherencia cajas ↔ tarimas. Devuelve el texto del error o null. */
+const errorCoherencia = (cajas, tarimas) => {
+    if (tarimas > 0 && cajas > 0) {
+        if (tarimas > cajas) return `${tarimas} tarimas con solo ${cajas} cajas no es posible`;
+        if (cajas > tarimas * 60) return `${cajas} cajas no caben en ${tarimas} tarimas (máximo ~48 por tarima)`;
+    }
+    return null;
+};
+
 export const validarRecepcion = (req, res, next) => {
     const {
         id_produccion,
@@ -49,7 +69,6 @@ export const validarRecepcion = (req, res, next) => {
     // NULL es válido: la producción va directo a CEDA sin pasar por
     // preenfrío. En ese caso el trigger no genera ocupación alguna.
     let camaraNum = null;
-
     if (id_camara !== undefined && id_camara !== null && id_camara !== "") {
         if (isNaN(Number(id_camara))) {
             return res.status(400).json({
@@ -67,7 +86,6 @@ export const validarRecepcion = (req, res, next) => {
     }
 
     const fecha = aFechaISO(fecha_recepcion);
-
     if (!fecha) {
         return res.status(400).json({
             error: 'El campo "fecha_recepcion" no es una fecha válida (usa AAAA-MM-DD)'
@@ -88,7 +106,7 @@ export const validarRecepcion = (req, res, next) => {
         });
     }
 
-    if (!/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(String(hora_recepcion))) {
+    if (!PATRON_HORA.test(String(hora_recepcion))) {
         return res.status(400).json({
             error: 'El campo "hora_recepcion" debe tener formato HH:MM o HH:MM:SS'
         });
@@ -126,25 +144,15 @@ export const validarRecepcion = (req, res, next) => {
     // Coherencia cajas ↔ tarimas. Mismo criterio que producción: la regla
     // es ~48 cajas por tarima, se deja margen amplio y solo se rechaza lo
     // imposible.
-    if (tarimas > 0 && cajas > 0) {
-        if (tarimas > cajas) {
-            return res.status(400).json({
-                error: `Revisa las cantidades: ${tarimas} tarimas con solo ${cajas} cajas no es posible`
-            });
-        }
-
-        if (cajas > tarimas * 60) {
-            return res.status(400).json({
-                error: `Revisa las cantidades: ${cajas} cajas no caben en ${tarimas} tarimas (máximo ~48 por tarima)`
-            });
-        }
+    const incoherencia = errorCoherencia(cajas, tarimas);
+    if (incoherencia) {
+        return res.status(400).json({ error: `Revisa las cantidades: ${incoherencia}` });
     }
 
     // ---- Tarimas ingresadas ----
     // NULL significa "que el trigger calcule lo que quepa". Con valor,
     // significa "el operador vio el patio y confirmó cuántas metió".
     let ingresadasNum = null;
-
     if (
         tarimas_ingresadas !== undefined &&
         tarimas_ingresadas !== null &&
@@ -172,7 +180,6 @@ export const validarRecepcion = (req, res, next) => {
     // valor se valida pero no manda. Se conserva para no romper el contrato
     // con el frontend.
     let cajasIngNum = null;
-
     if (
         cajas_ingresadas !== undefined &&
         cajas_ingresadas !== null &&
@@ -197,22 +204,9 @@ export const validarRecepcion = (req, res, next) => {
     // NUMERIC(5,2) en la BD. El rango se acota a lo físicamente posible en
     // fruta: por debajo de -5 °C ya hay daño por congelación y por encima
     // de 45 °C el dato es un error de captura o un termómetro descompuesto.
-    let tempNum = null;
-
-    if (temperatura !== undefined && temperatura !== null && temperatura !== "") {
-        tempNum = Number(temperatura);
-
-        if (isNaN(tempNum)) {
-            return res.status(400).json({
-                error: 'El campo "temperatura" debe ser numérico'
-            });
-        }
-
-        if (tempNum < -5 || tempNum > 45) {
-            return res.status(400).json({
-                error: 'El campo "temperatura" está fuera de rango (-5 a 45 °C). Revisa la lectura.'
-            });
-        }
+    const temp = leerTemperatura(temperatura);
+    if (temp.error) {
+        return res.status(400).json({ error: temp.error });
     }
 
     // ---- Observaciones ----
@@ -230,9 +224,136 @@ export const validarRecepcion = (req, res, next) => {
     req.body.tarimas_recibidas = tarimas;
     req.body.tarimas_ingresadas = ingresadasNum;
     req.body.cajas_ingresadas = cajasIngNum;
-    req.body.temperatura = tempNum;
+    req.body.temperatura = temp.valor;
     req.body.observaciones = observaciones ? String(observaciones).trim() : null;
 
+    next();
+};
+
+// ----------------------------------------------------------------------------
+// Recepción por lote
+// ----------------------------------------------------------------------------
+// Un camión trae varias líneas (lote + SKU). Cada línea lleva lo que bajó y
+// cómo queda:
+//   parcial    llega más después          → debe traer cajas o tarimas
+//   completa   ya no llega más            → puede ir en 0 si ya se había
+//                                            recibido en viajes anteriores
+//   no_llego   hoy no llegó nada          → cajas y tarimas en 0
+//
+// Temperatura opcional (por ahora).
+const CIERRES = ["parcial", "completa", "no_llego"];
+const MAX_LINEAS = 50;
+
+export const validarRecepcionLote = (req, res, next) => {
+    const {
+        fecha_recepcion,
+        hora_recepcion,
+        id_camara,
+        temperatura,
+        observaciones,
+        lineas
+    } = req.body ?? {};
+
+    // ---- Fecha y hora ----
+    const fecha = fecha_recepcion ? aFechaISO(fecha_recepcion) : null;
+    if (!fecha) {
+        return res.status(400).json({ error: 'El campo "fecha_recepcion" es obligatorio (AAAA-MM-DD)' });
+    }
+    if (esFechaFutura(fecha)) {
+        return res.status(400).json({ error: "La fecha de recepción no puede ser futura" });
+    }
+    if (!hora_recepcion || !PATRON_HORA.test(String(hora_recepcion))) {
+        return res.status(400).json({ error: 'El campo "hora_recepcion" es obligatorio (HH:MM)' });
+    }
+
+    // ---- Cámara (opcional: solo si el camión se desvió) ----
+    let camaraNum = null;
+    if (id_camara !== undefined && id_camara !== null && id_camara !== "") {
+        camaraNum = Number(id_camara);
+        if (!Number.isInteger(camaraNum) || camaraNum <= 0) {
+            return res.status(400).json({ error: 'El campo "id_camara" debe ser numérico' });
+        }
+    }
+
+    // ---- Temperatura y observaciones ----
+    const temp = leerTemperatura(temperatura);
+    if (temp.error) {
+        return res.status(400).json({ error: temp.error });
+    }
+    if (observaciones && String(observaciones).length > 250) {
+        return res.status(400).json({ error: 'El campo "observaciones" no puede exceder 250 caracteres' });
+    }
+
+    // ---- Líneas ----
+    if (!Array.isArray(lineas) || lineas.length === 0) {
+        return res.status(400).json({ error: "Captura al menos una línea" });
+    }
+    if (lineas.length > MAX_LINEAS) {
+        return res.status(400).json({ error: `Máximo ${MAX_LINEAS} líneas por recepción` });
+    }
+
+    const vistos = new Set();
+    const limpias = [];
+
+    for (const [i, l] of lineas.entries()) {
+        const n = i + 1;
+        if (!l || typeof l !== "object") {
+            return res.status(400).json({ error: `La línea ${n} no tiene un formato válido` });
+        }
+
+        const idProd = Number(l.id_produccion);
+        if (!Number.isInteger(idProd) || idProd <= 0) {
+            return res.status(400).json({ error: `Línea ${n}: "id_produccion" inválido` });
+        }
+        if (vistos.has(idProd)) {
+            return res.status(400).json({ error: `Línea ${n}: la producción ${idProd} viene repetida` });
+        }
+        vistos.add(idProd);
+
+        if (!CIERRES.includes(l.cierre)) {
+            return res.status(400).json({ error: `Línea ${n}: "cierre" debe ser parcial, completa o no_llego` });
+        }
+
+        const cajas = l.cajas === undefined || l.cajas === null || l.cajas === "" ? 0 : Number(l.cajas);
+        const tarimas = l.tarimas === undefined || l.tarimas === null || l.tarimas === "" ? 0 : Number(l.tarimas);
+
+        if (!esEnteroNoNegativo(cajas) || !esEnteroNoNegativo(tarimas)) {
+            return res.status(400).json({ error: `Línea ${n}: cajas y tarimas deben ser enteros mayores o iguales a 0` });
+        }
+
+        if (l.cierre === "no_llego" && (cajas > 0 || tarimas > 0)) {
+            return res.status(400).json({ error: `Línea ${n}: si no llegó, cajas y tarimas van en 0` });
+        }
+        if (l.cierre === "parcial" && cajas === 0 && tarimas === 0) {
+            return res.status(400).json({ error: `Línea ${n}: una recepción parcial debe traer cajas o tarimas` });
+        }
+
+        const incoherencia = errorCoherencia(cajas, tarimas);
+        if (incoherencia) {
+            return res.status(400).json({ error: `Línea ${n}: revisa las cantidades, ${incoherencia}` });
+        }
+
+        if (l.observaciones && String(l.observaciones).length > 250) {
+            return res.status(400).json({ error: `Línea ${n}: las observaciones no pueden exceder 250 caracteres` });
+        }
+
+        limpias.push({
+            id_produccion: idProd,
+            cajas,
+            tarimas,
+            cierre: l.cierre,
+            observaciones: l.observaciones ? String(l.observaciones).trim() : null
+        });
+    }
+
+    req.body = {
+        fecha_recepcion: fecha,
+        hora_recepcion: String(hora_recepcion),
+        id_camara: camaraNum,
+        temperatura: temp.valor,
+        observaciones: observaciones ? String(observaciones).trim() : null,
+        lineas: limpias
+    };
     next();
 };
 
@@ -246,22 +367,9 @@ export const validarRecepcion = (req, res, next) => {
 export const validarEdicionRecepcion = (req, res, next) => {
     const { temperatura, observaciones } = req.body;
 
-    let tempNum = null;
-
-    if (temperatura !== undefined && temperatura !== null && temperatura !== "") {
-        tempNum = Number(temperatura);
-
-        if (isNaN(tempNum)) {
-            return res.status(400).json({
-                error: 'El campo "temperatura" debe ser numérico'
-            });
-        }
-
-        if (tempNum < -5 || tempNum > 45) {
-            return res.status(400).json({
-                error: 'El campo "temperatura" está fuera de rango (-5 a 45 °C)'
-            });
-        }
+    const temp = leerTemperatura(temperatura);
+    if (temp.error) {
+        return res.status(400).json({ error: temp.error });
     }
 
     if (observaciones && String(observaciones).length > 250) {
@@ -270,9 +378,43 @@ export const validarEdicionRecepcion = (req, res, next) => {
         });
     }
 
-    req.body.temperatura = tempNum;
+    req.body.temperatura = temp.valor;
     req.body.observaciones = observaciones ? String(observaciones).trim() : null;
 
+    next();
+};
+
+// ----------------------------------------------------------------------------
+// Alertas
+// ----------------------------------------------------------------------------
+// Atender exige comentario: es lo que se hizo con la diferencia (se ajustó
+// el plan, se reclamó al productor, era fruta comprada…).
+export const validarAtencionAlerta = (req, res, next) => {
+    const comentario = req.body?.comentario ? String(req.body.comentario).trim() : "";
+
+    if (comentario.length < 5) {
+        return res.status(400).json({ error: "Escribe qué se hizo con la alerta (al menos 5 caracteres)" });
+    }
+    if (comentario.length > 500) {
+        return res.status(400).json({ error: "El comentario no puede exceder 500 caracteres" });
+    }
+
+    req.body = { comentario };
+    next();
+};
+
+// Reabrir una línea confirmada exige motivo: cambia una cifra ya cerrada.
+export const validarReapertura = (req, res, next) => {
+    const motivo = req.body?.motivo ? String(req.body.motivo).trim() : "";
+
+    if (motivo.length < 10) {
+        return res.status(400).json({ error: "Explica por qué se reabre la línea (al menos 10 caracteres)" });
+    }
+    if (motivo.length > 250) {
+        return res.status(400).json({ error: "El motivo no puede exceder 250 caracteres" });
+    }
+
+    req.body = { motivo };
     next();
 };
 
@@ -283,6 +425,16 @@ export const validarIdRecepcion = (req, res, next) => {
         return res.status(400).json({
             error: "El id de recepción debe ser un número válido"
         });
+    }
+
+    next();
+};
+
+export const validarIdCierre = (req, res, next) => {
+    const id = Number(req.params.id);
+
+    if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: "El id de la alerta debe ser un número válido" });
     }
 
     next();

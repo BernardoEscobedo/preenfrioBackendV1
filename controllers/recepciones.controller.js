@@ -1,3 +1,4 @@
+import { db } from "../database/connection.database.js";
 import recepcionesModel from "../models/recepciones.model.js";
 import produccionModel from "../models/produccion.model.js";
 import camarasModel from "../models/camaras.model.js";
@@ -20,6 +21,13 @@ import camarasModel from "../models/camaras.model.js";
 //   lo que todavía tiene (el trigger corta con GREATEST para no quedar en
 //   negativo).
 //
+// CONFIRMACIÓN Y ALERTAS
+//   La recepción por lote (POST /lote) registra varias líneas a la vez y
+//   permite confirmarlas como completas o marcar que no llegaron. Las
+//   diferencias contra el plan quedan como alerta para el coordinador.
+//   Una línea confirmada no acepta más recepciones ni cancelaciones hasta
+//   que se reabre (trg_proteger_linea_cerrada responde con P0001).
+//
 // CORRECCIONES DE LA AUDITORÍA
 //   · El aviso de sobre-recepción nunca aparecía. Se leía
 //     produccion.tarimas_planeadas, un alias que no existe en el SELECT de
@@ -41,6 +49,9 @@ import camarasModel from "../models/camaras.model.js";
 //     decía "Entraron 0 tarimas": se leía la ocupación tipo 1, que es
 //     compartida y solo lleva el id de la PRIMERA recepción. Ahora se usa
 //     tarimas_ingresadas (o se deduce de la cola si falta la v2.5).
+//
+//   · Los rechazos de los triggers (P0001) se respondían como 500. Ahora
+//     son 409 con el mensaje de la BD.
 // ============================================================================
 
 // GET /api/preenfrio/recepciones?id_produccion=5&estado=1
@@ -78,6 +89,7 @@ const getRecepciones = async (req, res) => {
 const getRecepcionById = async (req, res) => {
     try {
         const { id } = req.params;
+
         const recepcion = await recepcionesModel.getRecepcionById(id);
 
         if (!recepcion) {
@@ -110,6 +122,7 @@ const getRecepcionById = async (req, res) => {
 
 // GET /api/preenfrio/recepciones/esperadas?semana=39
 // Lo que el preenfrío espera recibir. Es la pantalla principal del andén.
+//   ?todas=1 incluye las líneas ya confirmadas como completas
 const getEsperadas = async (req, res) => {
     try {
         const { semana, id_camara, todas } = req.query;
@@ -118,8 +131,8 @@ const getEsperadas = async (req, res) => {
             {
                 semana: semana ? Number(semana) : null,
                 id_camara: id_camara ? Number(id_camara) : null,
-                // Por defecto solo lo pendiente: es lo que necesita el
-                // andén. ?todas=1 muestra también lo ya completado.
+                // Por defecto solo lo que falta confirmar: es lo que
+                // necesita el andén.
                 solo_pendientes: todas !== "1" && todas !== "true"
             },
             req.camaras
@@ -257,7 +270,6 @@ const createRecepcion = async (req, res) => {
         const totalTrasEsta = yaRecibidas + Number(tarimas_recibidas);
 
         let avisoExceso = null;
-
         if (planeadas > 0 && totalTrasEsta > planeadas) {
             avisoExceso = `Con esta recepción se acumulan ${totalTrasEsta} tarimas contra ${planeadas} planeadas. Verifica que no se haya mezclado fruta de otro proceso.`;
         }
@@ -296,7 +308,6 @@ const createRecepcion = async (req, res) => {
             Math.max(Number(completa.tarimas_recibidas) - tarimasEnCola, 0);
 
         let resultado;
-
         if (camaraDestino === null) {
             resultado = "Recepción registrada. Esta producción no pasa por preenfrío (CEDA directo): no ocupa cámara.";
         } else if (tarimasEnCola > 0) {
@@ -314,6 +325,11 @@ const createRecepcion = async (req, res) => {
         });
     } catch (error) {
         console.error("Error al crear recepcion:", error);
+
+        // Rechazos de los triggers (por ejemplo, línea ya confirmada)
+        if (error.code === "P0001") {
+            return res.status(409).json({ error: error.message });
+        }
 
         if (error.code === "23503") {
             return res.status(409).json({
@@ -344,6 +360,7 @@ const updateRecepcion = async (req, res) => {
         const { id } = req.params;
 
         const existente = await recepcionesModel.getRecepcionById(id);
+
         if (!existente) {
             return res.status(404).json({ error: "Recepción no encontrada" });
         }
@@ -390,6 +407,9 @@ const updateRecepcion = async (req, res) => {
 //                                     recepción metió y cierra su fila de
 //                                     cola
 //
+// Si la línea ya se confirmó como completa, trg_proteger_linea_cerrada lo
+// rechaza (409): hay que reabrirla primero.
+//
 // Lo que se compara para saber cuánto se liberó es tarimas_ocupadas, no
 // tarimas_disponibles: la segunda nunca baja de 0 y vale 0 en
 // mantenimiento, así que daba cifras falsas.
@@ -398,6 +418,7 @@ const cancelarRecepcion = async (req, res) => {
         const { id } = req.params;
 
         const existente = await recepcionesModel.getRecepcionById(id);
+
         if (!existente) {
             return res.status(404).json({ error: "Recepción no encontrada" });
         }
@@ -449,7 +470,6 @@ const cancelarRecepcion = async (req, res) => {
         }
 
         let resultado;
-
         if (!existente.id_camara) {
             resultado = "Recepción cancelada. No ocupaba cámara (CEDA directo).";
         } else if (liberadas > 0) {
@@ -477,6 +497,11 @@ const cancelarRecepcion = async (req, res) => {
         });
     } catch (error) {
         console.error("Error al cancelar la recepcion:", error);
+
+        if (error.code === "P0001") {
+            return res.status(409).json({ error: error.message });
+        }
+
         res.status(500).json({ error: "Error al cancelar la recepción" });
     }
 };
@@ -499,6 +524,7 @@ const reactivarRecepcion = async (req, res) => {
         const { id } = req.params;
 
         const existente = await recepcionesModel.getRecepcionById(id);
+
         if (!existente) {
             return res.status(404).json({ error: "Recepción no encontrada" });
         }
@@ -569,7 +595,352 @@ const reactivarRecepcion = async (req, res) => {
         });
     } catch (error) {
         console.error("Error al reactivar la recepcion:", error);
+
+        // La BD actual rechaza reactivar (fn_revertir_recepcion): se
+        // devuelve su mensaje en vez de un 500.
+        if (error.code === "P0001") {
+            return res.status(409).json({ error: error.message });
+        }
+
         res.status(500).json({ error: "Error al reactivar la recepción" });
+    }
+};
+
+// ============================================================================
+// RECEPCIÓN POR LOTE · confirmación y alertas
+// ============================================================================
+// El operativo recibe un camión: captura por línea (lote + SKU) lo que bajó
+// y marca cada línea como:
+//
+//   parcial    llega más después: solo se registra la recepción
+//   completa   ya no llega más: se compara contra el plan
+//   no_llego   hoy no llegó nada: alerta, la línea sigue abierta
+//
+// Todo va en UNA transacción: o entran todas las líneas o ninguna. Las
+// recepciones se insertan igual que en el alta individual, así que los
+// triggers de inventario reparten entre cámara y cola como siempre.
+//
+// La diferencia contra el plan NO la calcula este controller: la calcula
+// trg_cierre_recepcion con las recepciones reales. Sin tolerancia: una caja
+// de más o de menos ya es alerta.
+// ============================================================================
+
+const ERRORES_NEGOCIO = ["P0001", "23514"];
+
+/** Errores de la BD con mensaje útil. Devuelve true si ya respondió. */
+const responderErrorBD = (res, error) => {
+    if (ERRORES_NEGOCIO.includes(error.code)) {
+        res.status(409).json({ error: error.message });
+        return true;
+    }
+    if (error.code === "23505") {
+        res.status(409).json({
+            error: "Otra persona confirmó esa línea al mismo tiempo. Actualiza la pantalla."
+        });
+        return true;
+    }
+    if (error.code === "23503") {
+        res.status(409).json({ error: "La producción o la cámara indicadas no existen" });
+        return true;
+    }
+    return false;
+};
+
+const etiquetaLinea = (f) => `${f.codigo_lote ?? `Línea ${f.id_produccion}`} · ${f.codigo_sku}`;
+
+// POST /api/preenfrio/recepciones/lote
+const recibirLote = async (req, res) => {
+    const {
+        fecha_recepcion,
+        hora_recepcion,
+        id_camara,
+        temperatura,
+        observaciones,
+        lineas
+    } = req.body;
+
+    const client = await db.connect();
+
+    try {
+        await client.query("BEGIN");
+
+        const filas = await recepcionesModel.getLineasParaRecibir(
+            client,
+            lineas.map((l) => l.id_produccion)
+        );
+        const porId = new Map(filas.map((f) => [Number(f.id_produccion), f]));
+
+        // ---- Validar todas las líneas antes de insertar nada ----
+        const problemas = [];
+        let sinAcceso = false;
+
+        for (const l of lineas) {
+            const f = porId.get(l.id_produccion);
+            if (!f) {
+                problemas.push(`La línea ${l.id_produccion} no existe`);
+                continue;
+            }
+            const nombre = etiquetaLinea(f);
+            const destino = id_camara ?? f.id_camara;
+
+            if (Number(f.estado) === 0) problemas.push(`${nombre} está cancelada`);
+            else if (f.id_cierre_vigente)
+                problemas.push(`${nombre} ya se confirmó como completa: el coordinador debe reabrirla`);
+            else if (destino === null)
+                problemas.push(`${nombre} no tiene preenfrío asignado: el coordinador debe asignarlo antes de recibir`);
+            else if (Array.isArray(req.camaras) && !req.camaras.includes(Number(destino))) sinAcceso = true;
+
+            if (
+                l.cierre === "completa" &&
+                Number(f.cajas_recibidas) + Number(f.tarimas_recibidas) + l.cajas + l.tarimas === 0
+            ) {
+                problemas.push(`${nombre}: no se ha recibido nada. Si no llegó, márcala como "No llegó"`);
+            }
+        }
+
+        if (sinAcceso) {
+            await client.query("ROLLBACK");
+            return res.status(403).json({ error: "No tienes acceso a la cámara destino de alguna de las líneas" });
+        }
+
+        // ---- Cámaras que van a recibir fruta ----
+        const camarasConFruta = new Set(
+            lineas
+                .filter((l) => l.cajas > 0 || l.tarimas > 0)
+                .map((l) => id_camara ?? porId.get(l.id_produccion)?.id_camara)
+                .filter((c) => c !== null && c !== undefined)
+                .map(Number)
+        );
+
+        for (const idCam of camarasConFruta) {
+            const disp = await recepcionesModel.getDisponibilidad(idCam, client);
+            if (!disp) problemas.push("La cámara indicada no existe");
+            else if (Number(disp.estado) !== 1)
+                problemas.push(`La cámara "${disp.nombre_camara}" está fuera de servicio`);
+            else if (disp.en_mantenimiento)
+                problemas.push(
+                    `La cámara "${disp.nombre_camara}" está en mantenimiento: toda la fruta quedaría en cola. Libérala o elige otra cámara.`
+                );
+        }
+
+        if (problemas.length) {
+            await client.query("ROLLBACK");
+            return res.status(409).json({
+                error: `No se registró nada: ${problemas.slice(0, 6).join("; ")}`,
+                problemas
+            });
+        }
+
+        // ---- 1) Recepciones (disparan los triggers de inventario) ----
+        const insertadas = [];
+        for (const l of lineas) {
+            if (l.cajas === 0 && l.tarimas === 0) continue;
+            const f = porId.get(l.id_produccion);
+            const r = await recepcionesModel.createRecepcion(
+                {
+                    id_produccion: l.id_produccion,
+                    id_camara: id_camara ?? f.id_camara,
+                    fecha_recepcion,
+                    hora_recepcion,
+                    cajas_recibidas: l.cajas,
+                    tarimas_recibidas: l.tarimas,
+                    tarimas_ingresadas: null,
+                    cajas_ingresadas: null,
+                    temperatura,
+                    id_usuario: req.id_usuario,
+                    observaciones: l.observaciones ?? observaciones
+                },
+                client
+            );
+            insertadas.push(r.id_recepcion);
+        }
+
+        // ---- 2) Confirmaciones ----
+        const cierres = new Map();
+        for (const l of lineas) {
+            const f = porId.get(l.id_produccion);
+            const datos = {
+                id_produccion: l.id_produccion,
+                fecha_cierre: fecha_recepcion,
+                id_camara: id_camara ?? f.id_camara,
+                observaciones: l.observaciones ?? observaciones,
+                id_usuario: req.id_usuario
+            };
+            if (l.cierre === "completa") {
+                cierres.set(l.id_produccion, await recepcionesModel.confirmarCompleta(client, datos));
+            } else if (l.cierre === "no_llego") {
+                const nl = await recepcionesModel.marcarNoLlego(client, datos);
+                cierres.set(l.id_produccion, nl ?? { tipo_cierre: 2, alerta_estado: 1, repetido: true });
+            }
+        }
+
+        // ---- 3) Qué hicieron los triggers ----
+        const resultado = await recepcionesModel.getResultadoRecepciones(client, insertadas);
+        const recepPorLinea = new Map(resultado.map((r) => [Number(r.id_produccion), r]));
+
+        await client.query("COMMIT");
+
+        // ---- Respuesta ----
+        const avisos = [];
+        let alertas = 0;
+
+        const detalle = lineas.map((l) => {
+            const f = porId.get(l.id_produccion);
+            const r = recepPorLinea.get(l.id_produccion);
+            const c = cierres.get(l.id_produccion);
+            const totalCajas = Number(f.cajas_recibidas) + l.cajas;
+            const totalTarimas = Number(f.tarimas_recibidas) + l.tarimas;
+
+            if (c && Number(c.alerta_estado) === 1 && !c.repetido) alertas += 1;
+            if (r && Number(r.tarimas_en_cola) > 0) {
+                avisos.push(
+                    `${etiquetaLinea(f)}: ${r.tarimas_en_cola} tarima(s) quedaron EN COLA esperando espacio en "${r.nombre_camara}".`
+                );
+            }
+            if (id_camara !== null && f.id_camara !== null && Number(f.id_camara) !== Number(id_camara) && r) {
+                avisos.push(
+                    `${etiquetaLinea(f)} estaba planeada para "${f.nombre_camara}" y se recibió en otra cámara.`
+                );
+            }
+
+            return {
+                id_produccion: l.id_produccion,
+                codigo_lote: f.codigo_lote,
+                codigo_sku: f.codigo_sku,
+                cierre: l.cierre,
+                recibido_ahora: { cajas: l.cajas, tarimas: l.tarimas },
+                entraron: r ? Number(r.tarimas_ingresadas) : 0,
+                en_cola: r ? Number(r.tarimas_en_cola) : 0,
+                total: { cajas: totalCajas, tarimas: totalTarimas },
+                plan: { cajas: Number(f.cajas_planeadas), tarimas: Number(f.tarimas_planeadas) },
+                diferencia:
+                    l.cierre === "completa" && c
+                        ? { cajas: Number(c.diferencia_cajas), tarimas: Number(c.diferencia_tarimas) }
+                        : null,
+                alerta: Boolean(c && Number(c.alerta_estado) === 1)
+            };
+        });
+
+        const completas = lineas.filter((l) => l.cierre === "completa").length;
+        const noLlego = lineas.filter((l) => l.cierre === "no_llego").length;
+
+        const partes = [];
+        if (insertadas.length) partes.push(`${insertadas.length} recepción(es) registrada(s)`);
+        if (completas) partes.push(`${completas} línea(s) confirmada(s) como completa(s)`);
+        if (noLlego) partes.push(`${noLlego} marcada(s) como "no llegó"`);
+
+        res.status(201).json({
+            mensaje: partes.join(", ") || "Sin cambios",
+            alertas,
+            avisos,
+            lineas: detalle
+        });
+    } catch (error) {
+        await client.query("ROLLBACK");
+        console.error("Error al recibir el lote:", error);
+        if (responderErrorBD(res, error)) return;
+        res.status(500).json({ error: "Error al registrar la recepción. No se guardó nada." });
+    } finally {
+        client.release();
+    }
+};
+
+// GET /api/preenfrio/recepciones/alertas?estado=1
+const getAlertas = async (req, res) => {
+    try {
+        const { estado } = req.query;
+        const alertas = await recepcionesModel.getAlertas(
+            { estado: estado === "1" || estado === "2" ? Number(estado) : null },
+            req.camaras
+        );
+        res.status(200).json(alertas);
+    } catch (error) {
+        console.error("Error al obtener alertas:", error);
+        res.status(500).json({ error: "Error al obtener las alertas de recepción" });
+    }
+};
+
+// GET /api/preenfrio/recepciones/alertas/resumen
+const getResumenAlertas = async (req, res) => {
+    try {
+        res.status(200).json(await recepcionesModel.getResumenAlertas(req.camaras));
+    } catch (error) {
+        console.error("Error al obtener el resumen de alertas:", error);
+        res.status(500).json({ error: "Error al obtener el resumen de alertas" });
+    }
+};
+
+/** Alcance del coordinador sobre una alerta (req.camaras suele ser null). */
+const fueraDeAlcance = (req, cierre) =>
+    Array.isArray(req.camaras) &&
+    (cierre.id_camara_alerta === null || !req.camaras.includes(Number(cierre.id_camara_alerta)));
+
+// PATCH /api/preenfrio/recepciones/alertas/:id/atender
+const atenderAlerta = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const cierre = await recepcionesModel.getCierreById(id);
+
+        if (!cierre || Number(cierre.alerta_estado) === 0) {
+            return res.status(404).json({ error: "Alerta no encontrada" });
+        }
+        if (fueraDeAlcance(req, cierre)) {
+            return res.status(403).json({ error: "No tienes acceso a esa alerta" });
+        }
+        if (Number(cierre.alerta_estado) === 2) {
+            return res.status(409).json({ error: "La alerta ya estaba atendida" });
+        }
+
+        const atendida = await recepcionesModel.atenderAlerta(id, {
+            comentario: req.body.comentario,
+            id_usuario: req.id_usuario
+        });
+        if (!atendida) {
+            return res.status(409).json({ error: "Otra persona atendió la alerta al mismo tiempo" });
+        }
+
+        res.status(200).json({
+            mensaje: `Alerta del lote ${cierre.codigo_lote} atendida`,
+            alerta: await recepcionesModel.getCierreById(id)
+        });
+    } catch (error) {
+        console.error("Error al atender la alerta:", error);
+        res.status(500).json({ error: "Error al atender la alerta" });
+    }
+};
+
+// PATCH /api/preenfrio/recepciones/cierres/:id/reabrir
+// La línea vuelve a aceptar recepciones. Si su alerta seguía pendiente se
+// da por atendida con el motivo.
+const reabrirCierre = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const cierre = await recepcionesModel.getCierreById(id);
+
+        if (!cierre) {
+            return res.status(404).json({ error: "Confirmación no encontrada" });
+        }
+        if (fueraDeAlcance(req, cierre)) {
+            return res.status(403).json({ error: "No tienes acceso a esa línea" });
+        }
+        if (Number(cierre.tipo_cierre) !== 1 || !cierre.vigente) {
+            return res.status(409).json({ error: "Esa línea no está confirmada como completa" });
+        }
+
+        const reabierta = await recepcionesModel.reabrirCierre(id, {
+            motivo: req.body.motivo,
+            id_usuario: req.id_usuario
+        });
+        if (!reabierta) {
+            return res.status(409).json({ error: "La línea ya se había reabierto" });
+        }
+
+        res.status(200).json({
+            mensaje: `Línea ${cierre.codigo_lote} · ${cierre.codigo_sku} reabierta: ya puede recibir fruta y volver a confirmarse.`
+        });
+    } catch (error) {
+        console.error("Error al reabrir la línea:", error);
+        res.status(500).json({ error: "Error al reabrir la línea" });
     }
 };
 
@@ -581,5 +952,10 @@ export const recepcionesController = {
     createRecepcion,
     updateRecepcion,
     cancelarRecepcion,
-    reactivarRecepcion
+    reactivarRecepcion,
+    recibirLote,
+    getAlertas,
+    getResumenAlertas,
+    atenderAlerta,
+    reabrirCierre
 };
