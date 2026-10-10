@@ -332,9 +332,9 @@ const promoverDeCola = async (id_ocupacion, tarimas, fecha = null, hora = null) 
     const result = await db.query(
         `
         SELECT fn_promover_de_cola(
-            $1, $2,
+            $1::INT, $2::INT,
             COALESCE($3::DATE, CURRENT_DATE),
-            COALESCE($4::TIME, CURRENT_TIME)
+            COALESCE($4::TIME, LOCALTIME)
         ) AS resultado
         `,
         [id_ocupacion, tarimas, fecha, hora]
