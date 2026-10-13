@@ -20,8 +20,8 @@ import { aFechaISO, semanaISO } from "./fechas.js";
 //     con la columna Productor; si no, es error.
 //   · CEDIS + Cliente se resuelven con cedis_equivalencias. Si no hay
 //     equivalencia, el usuario elige el destino y queda recordado.
-//   · Estiba "Granel" o vacía = 0 tarimas, sin aviso. Con decimales se
-//     redondea hacia arriba, con aviso.
+//   · Estiba "Granel" o vacía = 0 tarimas, sin aviso. Con decimales: media
+//     tarima o más cuenta como tarima; menos, no (con aviso).
 //   · El lote lo propone el sistema (misma fórmula que fn_generar_lote). Si
 //     el del Excel es distinto, el usuario elige cuál se guarda.
 //   · El turno del lote sale del SKU.
@@ -220,19 +220,28 @@ const evaluarFila = (entrada, cat, destinos) => {
     }
 
     // ---- Cantidades ----
-    const cajas = aNumero(entrada.cajas);
+        const cajas = aNumero(entrada.cajas);
     if (cajas === null) error("cantidades", "Faltan las cajas procesadas");
     else if (!Number.isInteger(cajas) || cajas < 0) error("cantidades", `Cajas inválidas: ${entrada.cajas}`);
     else datos.cajas = cajas;
-
     const estibaTexto = limpiarTexto(entrada.estiba);
     if (!estibaTexto || /^granel$/i.test(estibaTexto)) datos.tarimas = 0;
     else {
         const est = aNumero(entrada.estiba);
         if (Number.isNaN(est) || est < 0) error("cantidades", `Estiba inválida: ${estibaTexto}`);
         else if (!Number.isInteger(est)) {
-            datos.tarimas = Math.ceil(est);
-            aviso("cantidades", `Estiba ${est} redondeada a ${datos.tarimas} tarimas`);
+            // Media tarima o más cuenta como tarima; menos de media se
+            // acomoda en las otras tarimas (o queda como granel si no hay)
+            datos.tarimas = Math.round(est);
+            const fraccion = Math.round((est - Math.floor(est)) * 100) / 100;
+            aviso(
+                "cantidades",
+                fraccion >= 0.5
+                    ? `Estiba ${est.toFixed(2)} → ${datos.tarimas} tarimas (sobra más de media tarima)`
+                    : datos.tarimas === 0
+                        ? `Estiba ${est.toFixed(2)} → 0 tarimas (menos de media tarima: se toma como granel)`
+                        : `Estiba ${est.toFixed(2)} → ${datos.tarimas} tarimas (las cajas sobrantes van en las otras tarimas)`
+            );
         } else datos.tarimas = est;
     }
 
