@@ -15,17 +15,13 @@ import { db } from "../database/connection.database.js";
 //     estado → 3 (finalizado)  cierra esa ocupación y libera la cámara
 //     estado → 4 (cancelado)   también la cierra (v2.4)
 //
-//   Mientras existe esa ocupación, fn_tarimas_disponibles devuelve 0 aunque
-//   la cámara esté vacía. Es la respuesta a "¿por qué toda la fruta se fue
-//   a la cola si había espacio?".
+//   v3: con el bloqueo activo la cámara NO RECIBE FRUTA. Lo garantizan en la
+//   BD trg_recepcion_camara_bloqueada y trg_movimiento_camara_bloqueada.
 //
-// v2.4 · EL HUECO DEL ESTADO 4 YA ESTÁ CERRADO
-//   Antes el trigger no tenía rama para el 4 y cancelar un mantenimiento en
-//   proceso dejaba la cámara trabada para siempre. La migración v2.4 agregó
-//   la rama y liberó los bloqueos que habían quedado huérfanos.
-//
-//   El controller sigue impidiendo cancelar uno en proceso, pero ahora por
-//   el dato, no por la BD: ese paro ocurrió y debe quedar en el histórico.
+// v3 · PROGRAMADOS
+//   Un preventivo programado (estado 1) se inicia solo a su hora:
+//   fn_activar_mantenimientos_programados, llamada por
+//   utils/mantenimientosProgramados.js.
 //
 // ESTADOS
 //   1 = programado   agendado, la cámara sigue operando
@@ -33,12 +29,25 @@ import { db } from "../database/connection.database.js";
 //   3 = finalizado   libera la cámara
 //   4 = cancelado    solo desde 'programado' (criterio del controller)
 //
+// "AHORA" EN LA ZONA DE OPERACIÓN
+//   fecha_inicio/hora_inicio se capturan en hora local. Las horas de paro se
+//   calculan contra (now() AT TIME ZONE zona), no contra CURRENT_TIMESTAMP:
+//   con la BD en UTC, un paro en proceso salía con 6 horas de más.
+//
 // ALCANCE
-//   La tabla SÍ tiene id_camara, así que es el caso simple:
-//   validarCamaraEnAlcance("body") alcanza para las escrituras.
+//   La tabla SÍ tiene id_camara: validarCamaraEnAlcance("body") alcanza para
+//   las escrituras.
 // ============================================================================
 
-const SELECT_MANTENIMIENTO = `
+/** Zona de operación como literal SQL seguro (viene del .env). */
+const zonaSQL = () => {
+    const z = process.env.ZONA_HORARIA || "America/Mexico_City";
+    return /^[A-Za-z_]+(\/[A-Za-z0-9_+-]+)*$/.test(z) ? `'${z}'` : "'America/Mexico_City'";
+};
+
+const ahoraSQL = () => `(now() AT TIME ZONE ${zonaSQL()})`;
+
+const selectMantenimiento = () => `
     SELECT
         m.*,
         c.nombre_camara,
@@ -69,28 +78,38 @@ const SELECT_MANTENIMIENTO = `
         -- importa: cada hora de paro es capacidad que no se usó.
         CASE
             WHEN m.fecha_fin IS NOT NULL THEN
-                ROUND(
-                    EXTRACT(EPOCH FROM (
-                        (m.fecha_fin + COALESCE(m.hora_fin, '00:00'::TIME))
-                        - (m.fecha_inicio + m.hora_inicio)
-                    )) / 3600,
-                    1
-                )
+                ROUND(EXTRACT(EPOCH FROM (
+                    (m.fecha_fin + COALESCE(m.hora_fin, '00:00'::TIME))
+                    - (m.fecha_inicio + m.hora_inicio)
+                )) / 3600, 1)
             WHEN m.estado = 2 THEN
-                ROUND(
-                    EXTRACT(EPOCH FROM (
-                        CURRENT_TIMESTAMP - (m.fecha_inicio + m.hora_inicio)
-                    )) / 3600,
-                    1
-                )
+                ROUND(EXTRACT(EPOCH FROM (
+                    ${ahoraSQL()} - (m.fecha_inicio + m.hora_inicio)
+                )) / 3600, 1)
             ELSE NULL
         END AS horas_paro,
+        -- Programados: cuántas horas faltan para que bloquee
+        CASE WHEN m.estado = 1 THEN
+            ROUND(EXTRACT(EPOCH FROM (
+                (m.fecha_inicio + m.hora_inicio) - ${ahoraSQL()}
+            )) / 3600, 1)
+        END AS horas_para_inicio,
+        ur.usuario  AS usuario_registro,
+        er.nombre   AS nombre_registro,
+        er.apellidos AS apellidos_registro,
+        uc.usuario  AS usuario_cierre,
+        ec.nombre   AS nombre_cierre,
+        ec.apellidos AS apellidos_cierre,
         -- La ocupación tipo 2 que generó el trigger. Si el mantenimiento
         -- está en proceso y esto viene NULL, algo salió mal.
         ocup.id_ocupacion AS id_ocupacion_bloqueo,
         ocup.estado       AS estado_bloqueo
     FROM mantenimientos m
     JOIN camaras c ON c.id_camara = m.id_camara
+    LEFT JOIN usuarios  ur ON ur.id_usuario  = m.id_usuario_registro
+    LEFT JOIN empleados er ON er.id_empleado = ur.id_empleado
+    LEFT JOIN usuarios  uc ON uc.id_usuario  = m.id_usuario_cierre
+    LEFT JOIN empleados ec ON ec.id_empleado = uc.id_empleado
     LEFT JOIN LATERAL (
         SELECT o.id_ocupacion, o.estado
         FROM ocupaciones_camaras o
@@ -113,7 +132,7 @@ const getMantenimientos = async (
 ) => {
     const result = await db.query(
         `
-        ${SELECT_MANTENIMIENTO}
+        ${selectMantenimiento()}
         WHERE ($1::INT IS NULL OR m.id_camara = $1)
           AND ($2::INT IS NULL OR m.estado = $2)
           AND ($3::INT IS NULL OR m.tipo = $3)
@@ -133,7 +152,7 @@ const getMantenimientos = async (
 
 const getMantenimientoById = async (id_mantenimiento) => {
     const result = await db.query(
-        `${SELECT_MANTENIMIENTO} WHERE m.id_mantenimiento = $1`,
+        `${selectMantenimiento()} WHERE m.id_mantenimiento = $1`,
         [id_mantenimiento]
     );
     return result.rows[0];
@@ -142,11 +161,10 @@ const getMantenimientoById = async (id_mantenimiento) => {
 // ----------------------------------------------------------------------------
 // Mantenimientos activos — los que están bloqueando cámaras ahora
 // ----------------------------------------------------------------------------
-// Es el reporte que explica por qué una cámara no recibe fruta.
 const getActivos = async (camaras = null) => {
     const result = await db.query(
         `
-        ${SELECT_MANTENIMIENTO}
+        ${selectMantenimiento()}
         WHERE m.estado = 2
           AND ($1::INT[] IS NULL OR m.id_camara = ANY($1))
         ORDER BY m.fecha_inicio, m.hora_inicio
@@ -156,11 +174,86 @@ const getActivos = async (camaras = null) => {
     return result.rows;
 };
 
+// ----------------------------------------------------------------------------
+// Tablero: cada cámara con su situación
+// ----------------------------------------------------------------------------
+// Operando / fuera de servicio / con preventivo programado, y la fruta que
+// tiene dentro y en cola. La pantalla principal del módulo.
+const getTablero = async (camaras = null) => {
+    const result = await db.query(
+        `
+        SELECT
+            c.id_camara, c.nombre_camara, c.tipo_camara, c.ubicacion,
+            c.capacidad_max_tarimas,
+            public.fn_camara_bloqueada(c.id_camara) AS bloqueada,
+            act.id_mantenimiento AS id_activo,
+            act.tipo             AS tipo_activo,
+            act.motivo           AS motivo_activo,
+            act.fecha_inicio     AS fecha_inicio_activo,
+            act.hora_inicio      AS hora_inicio_activo,
+            CASE WHEN act.id_mantenimiento IS NOT NULL THEN
+                ROUND(EXTRACT(EPOCH FROM (${ahoraSQL()} - (act.fecha_inicio + act.hora_inicio))) / 3600, 1)
+            END AS horas_paro,
+            prog.id_mantenimiento AS id_programado,
+            prog.motivo           AS motivo_programado,
+            prog.fecha_inicio     AS fecha_programado,
+            prog.hora_inicio      AS hora_programado,
+            COALESCE(inv.tarimas, 0)::INT AS tarimas_dentro,
+            COALESCE(inv.cajas, 0)::INT   AS cajas_dentro,
+            COALESCE(cola.tarimas, 0)::INT AS tarimas_en_cola
+        FROM camaras c
+        LEFT JOIN LATERAL (
+            SELECT id_mantenimiento, tipo, motivo, fecha_inicio, hora_inicio
+            FROM mantenimientos
+            WHERE id_camara = c.id_camara AND estado = 2
+            ORDER BY fecha_inicio, hora_inicio LIMIT 1
+        ) act ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT id_mantenimiento, motivo, fecha_inicio, hora_inicio
+            FROM mantenimientos
+            WHERE id_camara = c.id_camara AND estado = 1
+            ORDER BY fecha_inicio, hora_inicio LIMIT 1
+        ) prog ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT SUM(cantidad_tarimas) AS tarimas, SUM(cantidad_cajas) AS cajas
+            FROM ocupaciones_camaras
+            WHERE id_camara = c.id_camara AND tipo_ocupacion = 1 AND estado = 1
+        ) inv ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT SUM(cantidad_tarimas) AS tarimas
+            FROM ocupaciones_camaras
+            WHERE id_camara = c.id_camara AND tipo_ocupacion = 3 AND estado = 1
+        ) cola ON TRUE
+        WHERE c.estado = 1
+          AND ($1::INT[] IS NULL OR c.id_camara = ANY($1))
+        ORDER BY c.tipo_camara, c.nombre_camara
+        `,
+        [camaras]
+    );
+    return result.rows;
+};
+
+// Fruta dentro de la cámara, por lote: lo que hay que reubicar cuando la
+// cámara se para.
+const getFrutaDentro = async (id_camara) => {
+    const result = await db.query(
+        `
+        SELECT id_ocupacion, id_produccion, codigo_lote, codigo_sku, calidad_sku,
+               codigo_productor, codigo_finca, nombre_finca, acronimo_cc,
+               fecha_empaque, fecha_entrega, tarimas_disponibles, cajas_disponibles,
+               nivel_criticidad, criticidad_texto
+        FROM vw_inventario_disponible
+        WHERE id_camara = $1
+        ORDER BY nivel_criticidad, fecha_empaque NULLS LAST, id_ocupacion
+        `,
+        [id_camara]
+    );
+    return result.rows;
+};
+
 // Mantenimiento activo de una cámara concreta.
-// El controller lo consulta antes de iniciar otro: dos mantenimientos en
-// proceso sobre la misma cámara dejarían uno sin ocupación de bloqueo
-// propia, y al finalizar el primero la cámara se liberaría con otro paro
-// todavía abierto.
+// Dos mantenimientos en proceso sobre la misma cámara dejarían uno sin
+// ocupación de bloqueo propia.
 const getActivoPorCamara = async (id_camara, excluir_id = null) => {
     const result = await db.query(
         `
@@ -178,11 +271,8 @@ const getActivoPorCamara = async (id_camara, excluir_id = null) => {
 };
 
 // ----------------------------------------------------------------------------
-// Qué hay dentro de la cámara ahora mismo
+// Qué hay dentro de la cámara ahora mismo (totales)
 // ----------------------------------------------------------------------------
-// El controller lo consulta antes de iniciar un mantenimiento: bloquear una
-// cámara con fruta adentro no la saca físicamente, solo impide que entre
-// más. Hay que avisarlo.
 const getContenidoCamara = async (id_camara) => {
     const result = await db.query(
         `
@@ -206,7 +296,6 @@ const getContenidoCamara = async (id_camara) => {
 // Alta
 // ----------------------------------------------------------------------------
 // ⚠️ Si nace con estado 2, el trigger bloquea la cámara de inmediato.
-// El controller valida antes que no haya otro mantenimiento activo.
 const createMantenimiento = async ({
     id_camara,
     fecha_inicio,
@@ -216,15 +305,18 @@ const createMantenimiento = async ({
     tipo,
     motivo,
     prioridad,
-    estado
+    estado,
+    observaciones,
+    id_usuario
 }) => {
     const result = await db.query(
         `
         INSERT INTO mantenimientos (
             id_camara, fecha_inicio, hora_inicio, fecha_fin, hora_fin,
-            tipo, motivo, prioridad, estado
+            tipo, motivo, prioridad, estado,
+            observaciones, id_usuario_registro, fecha_hora_registro
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, ${ahoraSQL()})
         RETURNING *
         `,
         [
@@ -236,18 +328,18 @@ const createMantenimiento = async ({
             tipo,
             motivo,
             prioridad,
-            estado
+            estado,
+            observaciones,
+            id_usuario
         ]
     );
     return result.rows[0];
 };
 
-// Edición de datos administrativos. NO toca el estado: los cambios de
-// estado van por sus propios métodos porque cada uno dispara el trigger de
-// forma distinta.
+// Edición de datos administrativos. NO toca el estado.
 const updateMantenimiento = async (
     id_mantenimiento,
-    { fecha_inicio, hora_inicio, tipo, motivo, prioridad }
+    { fecha_inicio, hora_inicio, tipo, motivo, prioridad, observaciones }
 ) => {
     const result = await db.query(
         `
@@ -256,11 +348,12 @@ const updateMantenimiento = async (
             hora_inicio = $3,
             tipo = $4,
             motivo = $5,
-            prioridad = $6
+            prioridad = $6,
+            observaciones = $7
         WHERE id_mantenimiento = $1
         RETURNING *
         `,
-        [id_mantenimiento, fecha_inicio, hora_inicio, tipo, motivo, prioridad]
+        [id_mantenimiento, fecha_inicio, hora_inicio, tipo, motivo, prioridad, observaciones]
     );
     return result.rows[0];
 };
@@ -269,15 +362,10 @@ const updateMantenimiento = async (
 // Transiciones de estado
 // ----------------------------------------------------------------------------
 // Cada una va por su propio método porque el trigger reacciona distinto a
-// cada valor. Mezclarlas en un update genérico haría muy fácil disparar un
-// bloqueo sin querer.
+// cada valor.
 
-// estado → 2. El trigger crea la ocupación tipo 2 que bloquea TODA la
-// capacidad de la cámara.
-//
-// También se actualiza la fecha de inicio si viene: si el mantenimiento se
-// programó para las 8 y empezó a las 10, lo que importa para medir el paro
-// es la hora real.
+// estado → 2. El trigger bloquea TODA la capacidad de la cámara.
+// La fecha/hora de inicio se ajusta a la real si viene.
 const iniciarMantenimiento = async (id_mantenimiento, { fecha, hora }) => {
     const result = await db.query(
         `
@@ -294,42 +382,40 @@ const iniciarMantenimiento = async (id_mantenimiento, { fecha, hora }) => {
 };
 
 // estado → 3. El trigger cierra la ocupación tipo 2 y libera la cámara.
-//
-// El controller siempre manda fecha y hora, calculadas en la zona de la
-// operación. El COALESCE queda como respaldo si alguien llama al método
-// sin ellas.
-const finalizarMantenimiento = async (id_mantenimiento, { fecha, hora }) => {
+const finalizarMantenimiento = async (id_mantenimiento, { fecha, hora, comentario, id_usuario }) => {
     const result = await db.query(
         `
         UPDATE mantenimientos
         SET estado = 3,
-            fecha_fin = COALESCE($2::DATE, CURRENT_DATE),
-            hora_fin  = COALESCE($3::TIME, CURRENT_TIME)
+            fecha_fin = $2::DATE,
+            hora_fin  = $3::TIME,
+            comentario_cierre = $4,
+            id_usuario_cierre = $5
         WHERE id_mantenimiento = $1
         RETURNING *
         `,
-        [id_mantenimiento, fecha, hora]
+        [id_mantenimiento, fecha, hora, comentario, id_usuario]
     );
     return result.rows[0];
 };
 
-// estado → 4. El controller solo lo permite desde 'programado' (1): un
-// mantenimiento que llegó a bloquear la cámara se finaliza, no se cancela.
-// Aun así, desde la v2.4 el trigger libera la ocupación si la hubiera.
-const cancelarMantenimiento = async (id_mantenimiento) => {
+// estado → 4. Solo desde 'programado' (criterio del controller).
+const cancelarMantenimiento = async (id_mantenimiento, { comentario, id_usuario }) => {
     const result = await db.query(
         `
-        UPDATE mantenimientos SET estado = 4
+        UPDATE mantenimientos
+        SET estado = 4,
+            comentario_cierre = COALESCE($2, comentario_cierre),
+            id_usuario_cierre = $3
         WHERE id_mantenimiento = $1
         RETURNING *
         `,
-        [id_mantenimiento]
+        [id_mantenimiento, comentario, id_usuario]
     );
     return result.rows[0];
 };
 
-// Borrado físico. Solo para un alta mal capturada que nunca llegó a
-// bloquear nada: si generó una ocupación, la FK lo impide.
+// Borrado físico. Solo para un alta mal capturada que nunca bloqueó nada.
 const deleteMantenimiento = async (id_mantenimiento) => {
     const result = await db.query(
         `DELETE FROM mantenimientos WHERE id_mantenimiento = $1 RETURNING *`,
@@ -341,13 +427,6 @@ const deleteMantenimiento = async (id_mantenimiento) => {
 // ----------------------------------------------------------------------------
 // Ocupaciones de bloqueo huérfanas — diagnóstico
 // ----------------------------------------------------------------------------
-// Ocupaciones tipo 2 que siguen activas aunque su mantenimiento ya no esté
-// en proceso.
-//
-// Desde la v2.4 el trigger ya no las genera. Se conserva para lo que el
-// trigger no puede ver: ocupaciones tipo 2 creadas a mano sin mantenimiento
-// ligado (id_mantenimiento NULL, que el esquema permite) o restos de antes
-// de la migración.
 const getBloqueosHuerfanos = async (camaras = null) => {
     const result = await db.query(
         `
@@ -381,15 +460,14 @@ const getBloqueosHuerfanos = async (camaras = null) => {
     return result.rows;
 };
 
-// Cierra a mano una ocupación de bloqueo huérfana. Es la salida de
-// emergencia cuando una cámara quedó trabada.
+// Cierra a mano una ocupación de bloqueo huérfana.
 const cerrarBloqueo = async (id_ocupacion) => {
     const result = await db.query(
         `
         UPDATE ocupaciones_camaras
         SET estado = 0,
-            fecha_fin = CURRENT_DATE,
-            hora_fin = CURRENT_TIME,
+            fecha_fin = ${ahoraSQL()}::DATE,
+            hora_fin = ${ahoraSQL()}::TIME,
             observaciones = COALESCE(observaciones, '') ||
                 ' · Liberado manualmente desde el módulo de mantenimientos'
         WHERE id_ocupacion = $1
@@ -405,11 +483,7 @@ const cerrarBloqueo = async (id_ocupacion) => {
 // ----------------------------------------------------------------------------
 // Historial de paros por cámara
 // ----------------------------------------------------------------------------
-// Cuántas horas estuvo parada cada cámara y por qué. Es el insumo para
-// decidir si un equipo ya necesita reemplazo.
-//
-// Los cancelados no suman horas: nunca llegaron a bloquear (el controller
-// no permite cancelar uno en proceso).
+// Los cancelados no suman horas: nunca llegaron a bloquear.
 const getResumenPorCamara = async (
     { fecha_desde = null, fecha_hasta = null } = {},
     camaras = null
@@ -450,6 +524,8 @@ const mantenimientosModel = {
     getMantenimientos,
     getMantenimientoById,
     getActivos,
+    getTablero,
+    getFrutaDentro,
     getActivoPorCamara,
     getContenidoCamara,
     createMantenimiento,
