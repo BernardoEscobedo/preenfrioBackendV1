@@ -1,4 +1,5 @@
 import { db } from "../database/connection.database.js";
+import { sumarTemporales } from "../utils/alcanceTemporales.js"
 
 // ============================================================================
 // ALCANCE POR CÁMARA
@@ -76,7 +77,7 @@ export const cargarAlcance = async (req, res, next) => {
                 `[alcance] Usuario ${id_usuario} (rol ${id_role}) sin cámaras asignadas: no verá datos.`
             );
         }
-
+        req.camaras = await sumarTemporales(req.camaras);
         next();
     } catch (error) {
         console.error("Error al cargar el alcance del usuario:", error);

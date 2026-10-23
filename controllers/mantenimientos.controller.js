@@ -11,33 +11,27 @@ import { activarMantenimientosProgramados } from "../utils/mantenimientosProgram
 // ⚠️ ESTE MÓDULO BLOQUEA CAPACIDAD
 //   Pasar un mantenimiento a estado 2 dispara
 //   trg_sync_ocupacion_mantenimiento, que crea una ocupación tipo 2
-//   consumiendo TODA la capacidad de la cámara. Desde la v3, con ese bloqueo
-//   la cámara NO RECIBE FRUTA: la BD rechaza recepciones y traslados hacia
-//   ella, y la cola no puede ingresar (0 espacios).
+//   consumiendo TODA la capacidad de la cámara. Con ese bloqueo la cámara
+//   NO RECIBE FRUTA: la BD rechaza recepciones y traslados hacia ella, y la
+//   cola no puede ingresar (0 espacios).
 //
 // TIPOS
 //   1 Preventivo   se programa; bloquea A LA HORA PROGRAMADA
-//                  (fn_activar_mantenimientos_programados)
 //   2 Correctivo   la cámara dejó de funcionar bien: bloquea al registrarlo
 //   3 Emergencia   igual que correctivo, prioridad máxima
 //
-// v2.4 · EL TRIGGER CUBRE LOS TRES CAMINOS
-//     estado → 2   bloquea la cámara
-//     estado → 3   la libera (finalizar)
-//     estado → 4   la libera (cancelar)
+// OBLIGA A SACAR LA FRUTA
+//   Al quedar fuera de servicio, la respuesta trae requiere_reubicar si hay
+//   fruta dentro, y la pantalla abre el paso para sacarla (caja temporal,
+//   otra cámara o despacho). El mantenimiento NO se puede finalizar con
+//   fruta dentro: lo valida este controller y lo respalda
+//   trg_mantenimiento_sin_fruta en la BD.
 //
 // POR QUÉ SE SIGUE IMPIDIENDO CANCELAR UNO EN PROCESO
 //   Por el DATO: si la cámara estuvo parada, ese paro ocurrió y tiene que
-//   quedar en el histórico de horas de paro. "Cancelado" significa que
-//   nunca pasó.
+//   quedar en el histórico de horas de paro.
 //
-// FRUTA DENTRO
-//   El bloqueo no saca la fruta: impide que entre más. La respuesta y la
-//   pantalla avisan cuánta hay para reubicarla (Movimientos o Despachos).
-//
-// HORA LOCAL
-//   La fecha y hora "de ahora" salen de ZONA_HORARIA del .env, no de la
-//   zona del servidor.
+// HORA LOCAL: sale de ZONA_HORARIA del .env, no de la zona del servidor.
 // ============================================================================
 
 const zona = () => process.env.ZONA_HORARIA || "America/Mexico_City";
@@ -64,6 +58,15 @@ const normalizarHora = (hora) => {
 const sinAlcance = (req, id_camara) =>
     Array.isArray(req.camaras) && !req.camaras.includes(Number(id_camara));
 
+/** Rechazos de los triggers (P0001) con su mensaje. Devuelve true si respondió. */
+const responderErrorBD = (res, error) => {
+    if (error.code === "P0001") {
+        res.status(409).json({ error: error.message });
+        return true;
+    }
+    return false;
+};
+
 /** Avisos de lo que quedó dentro / en cola al bloquear. */
 const avisosDeContenido = (nombre, contenido) => {
     const avisos = [
@@ -71,16 +74,19 @@ const avisosDeContenido = (nombre, contenido) => {
     ];
     if (Number(contenido.tarimas_dentro) > 0) {
         avisos.push(
-            `⚠️ Hay ${contenido.tarimas_dentro} tarima(s) y ${contenido.cajas_dentro} cajas DENTRO. Reubícalas: trasládalas a otra cámara (Movimientos) o despáchalas (Despachos).`
+            `⚠️ Hay ${contenido.tarimas_dentro} tarima(s) y ${contenido.cajas_dentro} cajas DENTRO: hay que sacarlas (caja temporal, otra cámara o despacho). El mantenimiento no se podrá finalizar con fruta dentro.`
         );
     }
     if (Number(contenido.procesos_en_cola) > 0) {
         avisos.push(
-            `Hay ${contenido.procesos_en_cola} proceso(s) en cola esperando esta cámara: no podrán ingresar mientras dure el paro.`
+            `Hay ${contenido.procesos_en_cola} proceso(s) en cola esperando esta cámara: pásalos a una caja temporal o esperarán al fin del paro.`
         );
     }
     return avisos;
 };
+
+const requiereReubicar = (contenido) =>
+    Number(contenido.tarimas_dentro) > 0 || Number(contenido.procesos_en_cola) > 0;
 
 // GET /api/preenfrio/mantenimientos?estado=2&id_camara=1
 const getMantenimientos = async (req, res) => {
@@ -125,15 +131,15 @@ const getMantenimientoById = async (req, res) => {
     }
 };
 
-// ----------------------------------------------------------------------------
 // GET /api/preenfrio/mantenimientos/tablero
-// ----------------------------------------------------------------------------
-// Cada cámara con su situación: operando, fuera de servicio o con
-// preventivo programado, y la fruta que tiene dentro.
+// Cada cámara (preenfrío y conservación) con su situación. Las cajas
+// temporales se consultan aparte en /temporales.
 const getTablero = async (req, res) => {
     try {
         await activarMantenimientosProgramados(true);
-        const camaras = await mantenimientosModel.getTablero(req.camaras);
+        const camaras = (await mantenimientosModel.getTablero(req.camaras)).filter(
+            (c) => Number(c.tipo_camara) !== 3
+        );
         res.status(200).json({
             resumen: {
                 camaras: camaras.length,
@@ -150,7 +156,6 @@ const getTablero = async (req, res) => {
 };
 
 // GET /api/preenfrio/mantenimientos/camara/:id_camara/fruta
-// Lotes dentro de la cámara, para reubicarlos.
 const getFrutaDentro = async (req, res) => {
     try {
         const idCamara = Number(req.params.id_camara);
@@ -228,8 +233,7 @@ const getResumen = async (req, res) => {
 // POST /api/preenfrio/mantenimientos
 // ----------------------------------------------------------------------------
 // Correctivo / emergencia: nace en estado 2 y bloquea al instante.
-// Preventivo: nace en estado 1 y bloquea a su hora (si la hora ya pasó, se
-// inicia en este mismo momento).
+// Preventivo: nace en estado 1 y bloquea a su hora (si ya pasó, al guardar).
 const createMantenimiento = async (req, res) => {
     try {
         const { id_camara, estado } = req.body;
@@ -243,8 +247,12 @@ const createMantenimiento = async (req, res) => {
                 error: `La cámara "${camara.nombre_camara}" está dada de baja: no tiene sentido programarle mantenimiento.`
             });
         }
+        if (Number(camara.tipo_camara) === 3) {
+            return res.status(409).json({
+                error: "Es una caja temporal: no se le registran mantenimientos. Si falla, pasa su fruta a otra caja."
+            });
+        }
 
-        // ---- No puede haber dos bloqueos activos ----
         const activo = await mantenimientosModel.getActivoPorCamara(id_camara);
         if (Number(estado) === 2 && activo) {
             return res.status(409).json({
@@ -260,7 +268,6 @@ const createMantenimiento = async (req, res) => {
             id_usuario: req.id_usuario ?? null
         });
 
-        // Un preventivo cuya hora ya llegó se inicia aquí mismo
         if (Number(estado) === 1) await activarMantenimientosProgramados(true);
 
         const completo = await mantenimientosModel.getMantenimientoById(nuevo.id_mantenimiento);
@@ -270,7 +277,7 @@ const createMantenimiento = async (req, res) => {
         if (bloqueo) avisos.push(...avisosDeContenido(camara.nombre_camara, contenido));
         else if (activo) {
             avisos.push(
-                `La cámara ya tiene otro mantenimiento en proceso: este preventivo se iniciará cuando aquel se finalice y llegue su hora.`
+                "La cámara ya tiene otro mantenimiento en proceso: este preventivo se iniciará cuando aquel se finalice y llegue su hora."
             );
         } else {
             avisos.push(
@@ -283,10 +290,13 @@ const createMantenimiento = async (req, res) => {
                 ? `"${camara.nombre_camara}" fuera de servicio: ${completo.tipo_texto.toLowerCase()} registrado`
                 : `Preventivo programado para "${camara.nombre_camara}"`,
             mantenimiento: completo,
+            requiere_reubicar: bloqueo && requiereReubicar(contenido),
+            id_camara: Number(id_camara),
             avisos
         });
     } catch (error) {
         console.error("Error al crear el mantenimiento:", error);
+        if (responderErrorBD(res, error)) return;
         if (error.code === "23503") {
             return res.status(409).json({ error: "La cámara indicada no existe" });
         }
@@ -316,13 +326,13 @@ const updateMantenimiento = async (req, res) => {
         }
 
         await mantenimientosModel.updateMantenimiento(id, req.body);
-        // Si se movió la hora de un programado a una ya pasada, se inicia
         if (Number(existente.estado) === 1) await activarMantenimientosProgramados(true);
         const completo = await mantenimientosModel.getMantenimientoById(id);
 
         res.status(200).json({ mensaje: "Mantenimiento actualizado", mantenimiento: completo });
     } catch (error) {
         console.error("Error al actualizar el mantenimiento:", error);
+        if (responderErrorBD(res, error)) return;
         res.status(500).json({ error: "Error al actualizar el mantenimiento" });
     }
 };
@@ -369,10 +379,13 @@ const iniciarMantenimiento = async (req, res) => {
             mensaje: `Mantenimiento iniciado en "${completo.nombre_camara}"`,
             mantenimiento: completo,
             contenido_al_bloquear: contenido,
+            requiere_reubicar: requiereReubicar(contenido),
+            id_camara: Number(existente.id_camara),
             avisos: avisosDeContenido(completo.nombre_camara, contenido)
         });
     } catch (error) {
         console.error("Error al iniciar el mantenimiento:", error);
+        if (responderErrorBD(res, error)) return;
         res.status(500).json({ error: "Error al iniciar el mantenimiento" });
     }
 };
@@ -380,7 +393,8 @@ const iniciarMantenimiento = async (req, res) => {
 // ----------------------------------------------------------------------------
 // PATCH /api/preenfrio/mantenimientos/:id/finalizar
 // ----------------------------------------------------------------------------
-// estado 2 → 3. La cámara vuelve a recibir fruta.
+// estado 2 → 3. La cámara vuelve a recibir fruta. No se permite con fruta
+// dentro: el paro obliga a sacarla.
 const finalizarMantenimiento = async (req, res) => {
     try {
         const { id } = req.params;
@@ -395,6 +409,14 @@ const finalizarMantenimiento = async (req, res) => {
         if (Number(existente.estado) !== 2) {
             return res.status(409).json({
                 error: `Solo se puede finalizar un mantenimiento en proceso. Este está ${existente.estado_texto.toLowerCase()}.`
+            });
+        }
+
+        // ---- La fruta tuvo que salir ----
+        const contenido = await mantenimientosModel.getContenidoCamara(existente.id_camara);
+        if (Number(contenido.tarimas_dentro) > 0) {
+            return res.status(409).json({
+                error: `"${existente.nombre_camara}" todavía tiene ${contenido.tarimas_dentro} tarima(s) dentro. Sácala (caja temporal, otra cámara o despacho) antes de finalizar.`
             });
         }
 
@@ -424,8 +446,8 @@ const finalizarMantenimiento = async (req, res) => {
                 "⚠️ La ocupación de bloqueo sigue activa. Revisa /mantenimientos/bloqueos-huerfanos y libérala manualmente."
             );
         }
+        avisos.push("Si hay fruta en una caja temporal de esta cámara, reingrésala desde Mantenimientos › Cajas temporales.");
 
-        // Si había un preventivo esperando y ya es su hora, arranca ahora
         await activarMantenimientosProgramados(true);
 
         res.status(200).json({
@@ -435,6 +457,7 @@ const finalizarMantenimiento = async (req, res) => {
         });
     } catch (error) {
         console.error("Error al finalizar el mantenimiento:", error);
+        if (responderErrorBD(res, error)) return;
         res.status(500).json({ error: "Error al finalizar el mantenimiento" });
     }
 };
@@ -475,6 +498,7 @@ const cancelarMantenimiento = async (req, res) => {
         });
     } catch (error) {
         console.error("Error al cancelar el mantenimiento:", error);
+        if (responderErrorBD(res, error)) return;
         res.status(500).json({ error: "Error al cancelar el mantenimiento" });
     }
 };
@@ -482,7 +506,6 @@ const cancelarMantenimiento = async (req, res) => {
 // ----------------------------------------------------------------------------
 // POST /api/preenfrio/mantenimientos/bloqueos/:id_ocupacion/liberar
 // ----------------------------------------------------------------------------
-// Salida de emergencia: cierra a mano una ocupación tipo 2 huérfana. Admin.
 const liberarBloqueo = async (req, res) => {
     try {
         const { id_ocupacion } = req.params;
@@ -516,7 +539,6 @@ const liberarBloqueo = async (req, res) => {
 };
 
 // DELETE /api/preenfrio/mantenimientos/:id/eliminar
-// Borrado físico. Solo para un alta mal capturada que nunca bloqueó nada.
 const deleteMantenimiento = async (req, res) => {
     try {
         const { id } = req.params;
