@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { despachosController } from "../controllers/despachos.controller.js";
+import { despachoCompletoController } from "../controllers/despachoCompleto.controller.js";
 import {
     validarDespacho,
     validarLinea,
@@ -8,6 +9,7 @@ import {
     validarIdDespacho,
     validarIdDetalle
 } from "../middlewares/despachos.middleware.js";
+import { validarDespachoCompleto } from "../middlewares/despachoCompleto.middleware.js";
 import { cargarAlcance } from "../middlewares/alcance.middleware.js";
 import {
     verifyToken,
@@ -21,12 +23,22 @@ const router = Router();
 
 // ============================================================================
 // DESPACHOS
-// ver/armar picking = operativo+ · inspeccionar/cerrar = supervisor+
-// crear/editar = coordinador+ · reabrir/eliminar = admin
+// despachar (asistente) = operativo+ · ver/armar picking = operativo+
+// inspeccionar/cerrar = supervisor+ · crear/editar = coordinador+
+// reabrir/eliminar = admin
 // ============================================================================
 // El despacho es un DOCUMENTO; el picking es lo que lleva. Un mismo
 // despacho puede cargar fruta de varias cámaras, por eso se arma desde el
 // documento y no desde cada cámara.
+//
+// ---- DESPACHO EN UN PASO (asistente) ----
+//   POST /completo registra todo y lo CIERRA en una sola transacción:
+//   altas rápidas (operador, tracto, cajas), servicio de transporte,
+//   documento, inspección por caja, picking y cierre. Así funciona el
+//   andén: si la caja está bien, se carga y sale.
+//
+//   Lo puede hacer quien despacha (operativo+). El alcance se valida sobre
+//   cada cámara de la que sale fruta.
 //
 // ---- LA CADENA DE TRIGGERS ----
 //   Agregar línea  → trg_despacho_detalle_movimiento (BEFORE INSERT)
@@ -42,42 +54,30 @@ const router = Router();
 //   El backend NUNCA toca ocupaciones_camaras: una sola vía de descuento y
 //   una sola vía de reversa, las dos en la BD.
 //
-// ---- POR QUÉ ARMAR EL PICKING ES OPERATIVO ----
-//   Es trabajo de andén: el montacarguista sube tarimas y las va
-//   registrando. El riesgo está acotado: no puede subir más de lo que hay
-//   en la cámara ni tocar cámaras fuera de su alcance.
-//
-// ---- POR QUÉ INSPECCIONAR ES SUPERVISOR ----
-//   La revisión de la caja (limpieza, olores, plagas, estado de la unidad)
-//   se hace en el andén con la unidad enfrente, y la firma el supervisor de
-//   turno. Antes vivía en PATCH /transportes/:id/inocuidad; ahora es de
-//   CADA despacho: una caja aprobada ayer no está aprobada hoy.
-//
-// ---- POR QUÉ CERRAR ES SUPERVISOR ----
-//   Cerrar es declarar que el camión salió. Es el punto donde se aplican los
-//   bloqueos duros:
-//     · sin líneas de picking              → no se cierra
-//     · inspección pendiente o rechazada   → no se cierra
-//     · fruta de otro cliente              → exige ?confirmar=1 y queda
-//                                            auditado
+// ---- CIERRE ----
+//   Bloqueos duros (trg_validar_cierre y trg_validar_cierre_full):
+//     · sin líneas de picking                 → no se cierra
+//     · inspección pendiente o rechazada      → no se cierra
+//     · unidad full sin la 2ª caja aprobada   → no se cierra
+//     · fruta de otro cliente                 → exige confirmación y queda
+//                                               auditado
 //
 // ---- POR QUÉ REABRIR ES ADMIN ----
 //   Significa que el documento se cerró por error. Siempre con motivo y
 //   siempre registrado en la auditoría.
-//
-// ---- EL ALCANCE SOBRE UN DOCUMENTO SIN CÁMARA ----
-//   El despacho no tiene cámara: la tienen sus líneas. Un despacho armado
-//   pertenece a quien puso la fruta; uno vacío lo puede continuar
-//   cualquiera. No se usa validarCamaraEnAlcance porque ninguna acción
-//   recibe un id_camara en el body: siempre se deduce de la ocupación.
 // ============================================================================
 
 // ---- Consultas ----
 // Las rutas con prefijo fijo van ANTES de "/:id".
 
-// Dropdown del picking: solo clientes con fruta en las cámaras del alcance,
+// Dropdown de destinos: solo clientes con fruta en las cámaras del alcance,
 // ordenados por criticidad.
 router.get("/clientes-disponibles", verifyToken, verifyOperativo, cargarAlcance, despachosController.getClientesDisponibles);
+
+// Stock disponible para armar un despacho nuevo.
+//   ?id_cc=3          fruta planeada para ese cliente/CEDIS
+//   ?todos=1          incluye la de otros clientes (marcada)
+router.get("/inventario", verifyToken, verifyOperativo, cargarAlcance, despachoCompletoController.getInventario);
 
 // Listado. Lee vw_despachos.
 //   ?estado=1   ?id_cc=3   ?id_transporte=2
@@ -97,15 +97,24 @@ router.get("/:id/disponible", verifyToken, verifyOperativo, cargarAlcance, valid
 
 router.get("/:id/auditoria", verifyToken, verifyOperativo, cargarAlcance, validarIdDespacho, despachosController.getAuditoria);
 
-// ---- Documento ----
+// ---- ⭐ Despacho en un paso (asistente) ----
+// Va ANTES de "/:id" por ser un prefijo fijo.
+router.post(
+    "/completo",
+    verifyToken,
+    verifyOperativo,
+    cargarAlcance,
+    validarDespachoCompleto,
+    despachoCompletoController.crearDespachoCompleto
+);
+
+// ---- Documento (flujo por pasos, se conserva) ----
 // El folio lo genera la BD con fn_generar_folio_despacho (secuencia desde
-// 70000). Calcularlo con MAX(folio)+1 abriría una ventana de carrera.
-// Nace en borrador con la inspección PENDIENTE.
+// 70000). Nace en borrador con la inspección PENDIENTE.
 router.post("/", verifyToken, verifyCoordinador, cargarAlcance, validarDespacho, despachosController.createDespacho);
 
-// Editar el encabezado de un BORRADOR. No toca los totales: los deriva el
-// trigger desde el detalle. Si cambia el transporte, la BD borra la
-// inspección y hay que volver a revisar la caja.
+// Editar el encabezado de un BORRADOR. Si cambia el transporte, la BD borra
+// la inspección y hay que volver a revisar la caja.
 router.put("/:id", verifyToken, verifyCoordinador, cargarAlcance, validarIdDespacho, validarDespacho, despachosController.updateDespacho);
 
 // Corregir un despacho CERRADO. Exige motivo y registra auditoría con el
@@ -121,8 +130,7 @@ router.put(
     despachosController.updateDespacho
 );
 
-// ---- Inspección de inocuidad ----
-// Solo borradores. El usuario sale de la sesión y la fecha la pone la BD.
+// ---- Inspección de inocuidad (borradores) ----
 //   body: { inocuidad: 1 | 0, inocuidad_observaciones?: "texto" }
 router.patch(
     "/:id/inocuidad",
@@ -135,9 +143,6 @@ router.patch(
 );
 
 // ---- Picking ----
-// ⚠️ Agregar una línea descuenta la cámara vía la cadena de triggers.
-// El controller valida antes que no se suba más de lo que hay, para
-// responder con el saldo exacto del lote; la BD lo respalda.
 router.post(
     "/:id/lineas",
     verifyToken,
@@ -149,9 +154,7 @@ router.post(
 );
 
 // Quitar una línea: la fruta regresa a su cámara vía trg_revertir_movimiento.
-//
-// ⚠️ fn_quitar_linea_despacho devuelve TEXTO, no excepción. El controller
-// lee el prefijo 'OK:' para decidir entre 200 y 409.
+// fn_quitar_linea_despacho devuelve TEXTO, no excepción.
 router.delete(
     "/:id/lineas/:id_detalle",
     verifyToken,
@@ -163,8 +166,7 @@ router.delete(
 );
 
 // ---- Cierre ----
-// Exige inocuidad = 1 en el despacho. Con fruta de otro cliente:
-// ?confirmar=1 (viaja a la BD como app.confirmar_reasignacion).
+// Con fruta de otro cliente: ?confirmar=1
 router.patch("/:id/cerrar", verifyToken, verifySupervisor, cargarAlcance, validarIdDespacho, despachosController.cerrarDespacho);
 
 // Reabrir a borrador. Solo admin, siempre con motivo, siempre auditado.

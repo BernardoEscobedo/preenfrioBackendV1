@@ -27,6 +27,11 @@ import camarasModel from "../models/camaras.model.js";
 //   POST /:id/revertir es la operación normal (supervisor) y DELETE queda
 //   reservado a admin, para filas que nunca debieron existir.
 //
+// BLOQUES
+//   La fruta armada en bloques se traslada con POST /movimientos/bloque
+//   (movimientoBloque.controller). Aquí se rechaza moverla suelta y revertir
+//   por separado un movimiento de un traslado de bloque.
+//
 // CORRECCIÓN DE LA AUDITORÍA · REVERTIR EXIGE LAS DOS CÁMARAS
 //   Para LEER basta con tener una de las dos cámaras: si el traslado llegó
 //   a la tuya, es asunto tuyo. Pero revertirlo mete fruta en la cámara de
@@ -247,6 +252,21 @@ const createMovimiento = async (req, res) => {
             });
         }
 
+        // ---- Fruta armada en un bloque: se traslada con el bloque ----
+        // Moverla suelta dejaría las tarimas del bloque apuntando a una
+        // cámara donde ya no está la fruta.
+        if (origen.id_produccion) {
+            const bloques = await movimientosModel.getBloquesConLote(
+                origen.id_produccion,
+                origen.id_camara
+            );
+            if (bloques.length > 0) {
+                return res.status(409).json({
+                    error: `Este lote está armado en el bloque ${bloques.join(", ")}: trasládalo desde "Mover bloques" para que sus tarimas cambien de cámara junto con el inventario.`
+                });
+            }
+        }
+
         // ---- No se puede mover más de lo que hay ----
         // El trigger usa GREATEST(cantidad - movida, 0), así que un exceso
         // NO reventaría: dejaría el origen en cero y sumaría de más al
@@ -417,6 +437,16 @@ const revertirMovimiento = async (req, res) => {
                 error: linea
                     ? `Este movimiento pertenece al despacho ${linea.folio_despacho}. Para revertirlo, quita la línea desde el módulo de despachos.`
                     : "Este movimiento es una salida por despacho: revierte desde ese módulo."
+            });
+        }
+
+        // ---- Traslado de bloque: no se revierte suelto ----
+        // Un traslado de bloque crea un movimiento por lote y además cambia
+        // la cámara de sus tarimas. Revertir solo una parte dejaría el
+        // bloque partido entre el inventario y la ubicación física.
+        if (String(original.observaciones ?? "").startsWith("Traslado bloque")) {
+            return res.status(409).json({
+                error: "Este movimiento es parte de un traslado de bloque y no se revierte por separado. Pide a coordinación la corrección del bloque completo."
             });
         }
 

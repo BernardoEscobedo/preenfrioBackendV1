@@ -1,5 +1,7 @@
 import { Router } from "express";
 import { movimientosController } from "../controllers/movimientos.controller.js";
+import { movimientoBloqueController } from "../controllers/movimientoBloque.controller.js";
+import { validarTrasladoBloque } from "../middlewares/movimientoBloque.middleware.js";
 import {
     validarMovimiento,
     validarReversa,
@@ -99,7 +101,25 @@ router.get("/", verifyToken, verifyOperativo, cargarAlcance, movimientosControll
 // Devuelve además si el movimiento ya fue revertido, y por cuál.
 router.get("/:id", verifyToken, verifyOperativo, cargarAlcance, validarIdMovimiento, movimientosController.getMovimientoById);
 
+// ---- ⭐ Trasladar un BLOQUE (completo o parcial) ----
+// La vía normal: el bloque sale del preenfrío y pasa a conservación con
+// sus tarimas. Mueve el inventario (movimientos tipo 2 por lote) y la
+// ubicación de las tarimas en una sola transacción.
+//   body: { id_bloque, id_tarimas: [..], id_camara_destino,
+//           fecha_movimiento?, hora_movimiento?, temperatura?, observaciones? }
+router.post(
+    "/bloque",
+    verifyToken,
+    verifySupervisor,
+    cargarAlcance,
+    validarTrasladoBloque,
+    validarCamaraEnAlcance("body", "id_camara_destino"),
+    movimientoBloqueController.trasladarBloque
+);
+
 // ---- Registrar traslado ----
+// Por lote: solo para fruta que NO está armada en un bloque. Si el lote
+// está en un bloque, se traslada con el bloque (el controller lo rechaza).
 // ⚠️ Este INSERT dispara trg_sync_ocupacion_movimiento, que descuenta de la
 // ocupación de origen (cerrándola si queda en cero) y suma a la cámara
 // destino. El backend NO escribe en ocupaciones_camaras.

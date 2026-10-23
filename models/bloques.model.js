@@ -18,20 +18,22 @@ import { SQL_CAMARAS_REALES } from "../utils/camarasReales.sql.js";
 //
 //   Por eso bloques_produccion_detalle es N:M contra producción.
 //
+// BLOQUES POR TARIMA (módulo tarimas)
+//   Los bloques nuevos se arman por posición (bloques_tarimas, 10 o 12) y
+//   cada tarima sabe en qué cámara está. Este modelo los reconoce en
+//   getCamarasDelBloque, que es lo que usan pulpeos y evidencias para el
+//   alcance. Lo demás de este modelo atiende los bloques anteriores.
+//
 // ⚠️ LOS TOTALES NO SE CAPTURAN
-//   bloques_fruta.cantidad_tarimas y cantidad_cajas los mantiene
-//   trg_recalcular_totales_bloque sumando el detalle. Este modelo NUNCA los
-//   escribe: si lo hiciera, el número podría dejar de cuadrar con sus
-//   propias líneas.
+//   bloques_fruta.cantidad_tarimas y cantidad_cajas los mantienen
+//   trg_recalcular_totales_bloque (bloques anteriores) y
+//   trg_totales_bloque_tarimas (bloques por tarima). Este modelo NUNCA los
+//   escribe.
 //
 // ALCANCE POR CÁMARA
-//   bloques_fruta no tiene id_camara: el bloque se define por su contenido.
-//
 //   CORRECCIÓN DE LA AUDITORÍA · SE USA LA CÁMARA REAL, NO LA PLANEADA
-//   Antes el alcance salía de produccion.id_camara, que es el plan. Si en
-//   el andén desviaban el camión a otra cámara, el supervisor de donde
-//   realmente estaba la fruta no podía ver su bloque. Ahora se usa
-//   SQL_CAMARAS_REALES: donde se recibió, a donde se trasladó, y la
+//   Antes el alcance salía de produccion.id_camara, que es el plan. Ahora se
+//   usa SQL_CAMARAS_REALES: donde se recibió, a donde se trasladó, y la
 //   planeada solo mientras no haya llegado nada.
 // ============================================================================
 
@@ -182,8 +184,12 @@ const getDetalle = async (id_bloque) => {
     return result.rows;
 };
 
-// Cámaras donde está la fruta de este bloque. La usan bloques.controller
-// y pulpeos.controller para validar el alcance.
+// Cámaras donde está la fruta de este bloque. La usan bloques.controller,
+// pulpeos.controller y evidencias.controller para validar el alcance.
+//
+// Une las dos formas de bloque:
+//   · anterior   cámaras reales de sus procesos (bloques_produccion_detalle)
+//   · por tarima la cámara de cada tarima activa (bloques_tarimas)
 const getCamarasDelBloque = async (id_bloque) => {
     const result = await db.query(
         `
@@ -192,6 +198,10 @@ const getCamarasDelBloque = async (id_bloque) => {
         JOIN produccion p ON p.id_produccion = d.id_produccion
         CROSS JOIN LATERAL (${SQL_CAMARAS_REALES("p")}) AS cr(id_camara)
         WHERE d.id_bloque = $1
+        UNION
+        SELECT DISTINCT t.id_camara
+        FROM bloques_tarimas t
+        WHERE t.id_bloque = $1 AND t.estado = 1
         `,
         [id_bloque]
     );

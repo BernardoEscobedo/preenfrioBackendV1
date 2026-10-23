@@ -115,7 +115,18 @@ const getTrasladables = async ({ id_camara = null } = {}, camaras = null) => {
                     CURRENT_TIMESTAMP - (v.fecha_ingreso + v.hora_ingreso)
                 )) / 3600,
                 1
-            ) AS horas_en_preenfrio
+            ) AS horas_en_preenfrio,
+            -- Cajas de este lote armadas en bloques dentro de esta cámara:
+            -- esas se trasladan con su bloque, no sueltas.
+            COALESCE((
+                SELECT SUM(d.cantidad_cajas)
+                FROM bloques_tarimas_detalle d
+                JOIN bloques_tarimas t ON t.id_tarima = d.id_tarima
+                JOIN bloques_fruta b   ON b.id_bloque = t.id_bloque
+                WHERE d.id_produccion = v.id_produccion
+                  AND t.id_camara = v.id_camara
+                  AND t.estado = 1 AND b.estado = 1
+            ), 0)::INT AS cajas_en_bloques
         FROM vw_inventario_disponible v
         WHERE v.tipo_camara = 1
           AND ($1::INT IS NULL OR v.id_camara = $1)
@@ -369,7 +380,30 @@ const getResumen = async (
     return result.rows;
 };
 
+// ----------------------------------------------------------------------------
+// ¿El lote está armado en un bloque dentro de esa cámara?
+// ----------------------------------------------------------------------------
+// Si lo está, se traslada con el bloque (POST /movimientos/bloque): moverlo
+// suelto dejaría las tarimas del bloque apuntando a una cámara donde ya no
+// está la fruta.
+const getBloquesConLote = async (id_produccion, id_camara) => {
+    const result = await db.query(
+        `
+        SELECT DISTINCT b.codigo_bloque
+        FROM bloques_tarimas_detalle d
+        JOIN bloques_tarimas t ON t.id_tarima = d.id_tarima
+        JOIN bloques_fruta b   ON b.id_bloque = t.id_bloque
+        WHERE d.id_produccion = $1 AND t.id_camara = $2
+          AND t.estado = 1 AND b.estado = 1
+        ORDER BY b.codigo_bloque
+        `,
+        [id_produccion, id_camara]
+    );
+    return result.rows.map((r) => r.codigo_bloque);
+};
+
 const movimientosModel = {
+    getBloquesConLote,
     getMovimientos,
     getMovimientoById,
     getTrasladables,

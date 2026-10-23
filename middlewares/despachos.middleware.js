@@ -1,10 +1,10 @@
 // ============================================================================
 // VALIDACIONES DE DESPACHOS
 // ============================================================================
-// Aquí se valida el FORMATO del documento, del picking y de la inspección.
-// Lo que exige consultar la BD —que el transporte esté completo y activo,
-// que la ocupación tenga fruta suficiente, que el despacho siga en
-// borrador— vive en el controller.
+// AquÃ­ se valida el FORMATO del documento, del picking y de la inspecciÃ³n.
+// Lo que exige consultar la BD â€”que el transporte estÃ© completo y activo,
+// que la ocupaciÃ³n tenga fruta suficiente, que el despacho siga en
+// borradorâ€” vive en el controller.
 // ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -26,14 +26,14 @@ export const validarDespacho = (req, res, next) => {
     // ---- Transporte ----
     if (!id_transporte || isNaN(Number(id_transporte))) {
         return res.status(400).json({
-            error: 'El campo "id_transporte" es obligatorio y debe ser numérico'
+            error: 'El campo "id_transporte" es obligatorio y debe ser numÃ©rico'
         });
     }
 
     // ---- Cliente / CEDIS ----
     if (!id_cc || isNaN(Number(id_cc))) {
         return res.status(400).json({
-            error: 'El campo "id_cc" es obligatorio: indica a qué cliente y CEDIS va el despacho'
+            error: 'El campo "id_cc" es obligatorio: indica a quÃ© cliente y CEDIS va el despacho'
         });
     }
 
@@ -47,25 +47,25 @@ export const validarDespacho = (req, res, next) => {
     const fecha = new Date(fecha_despacho);
     if (isNaN(fecha.getTime())) {
         return res.status(400).json({
-            error: 'El campo "fecha_despacho" no es una fecha válida (usa AAAA-MM-DD)'
+            error: 'El campo "fecha_despacho" no es una fecha vÃ¡lida (usa AAAA-MM-DD)'
         });
     }
 
-    // A diferencia de recepciones y movimientos, aquí SÍ se permite fecha
-    // futura: los despachos se programan con días de anticipación contra la
-    // cita del CEDIS. El tope de 30 días atrapa el error de dedo en el año.
+    // A diferencia de recepciones y movimientos, aquÃ­ SÃ se permite fecha
+    // futura: los despachos se programan con dÃ­as de anticipaciÃ³n contra la
+    // cita del CEDIS. El tope de 30 dÃ­as atrapa el error de dedo en el aÃ±o.
     const limite = new Date();
     limite.setDate(limite.getDate() + 30);
 
     if (fecha > limite) {
         return res.status(400).json({
-            error: "La fecha de despacho está a más de 30 días: revisa el dato"
+            error: "La fecha de despacho estÃ¡ a mÃ¡s de 30 dÃ­as: revisa el dato"
         });
     }
 
     // ---- Hora de salida ----
-    // Opcional al crear el borrador: cuando se arma el picking todavía no
-    // se sabe a qué hora sale el camión.
+    // Opcional al crear el borrador: cuando se arma el picking todavÃ­a no
+    // se sabe a quÃ© hora sale el camiÃ³n.
     let horaNorm = null;
     if (hora_salida) {
         if (!/^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/.test(String(hora_salida))) {
@@ -77,14 +77,14 @@ export const validarDespacho = (req, res, next) => {
     }
 
     // ---- Fecha de cita ----
-    // Se hereda de la producción, pero se puede ajustar: las citas se
+    // Se hereda de la producciÃ³n, pero se puede ajustar: las citas se
     // reprograman.
     let fechaCitaNorm = null;
     if (fecha_cita) {
         const fc = new Date(fecha_cita);
         if (isNaN(fc.getTime())) {
             return res.status(400).json({
-                error: 'El campo "fecha_cita" no es una fecha válida (usa AAAA-MM-DD)'
+                error: 'El campo "fecha_cita" no es una fecha vÃ¡lida (usa AAAA-MM-DD)'
             });
         }
 
@@ -98,7 +98,7 @@ export const validarDespacho = (req, res, next) => {
     }
 
     // ---- Temperatura de salida ----
-    // El dato que respalda la cadena de frío ante el cliente. Mismo rango
+    // El dato que respalda la cadena de frÃ­o ante el cliente. Mismo rango
     // que en recepciones y movimientos.
     let tempNum = null;
     if (
@@ -109,12 +109,12 @@ export const validarDespacho = (req, res, next) => {
         tempNum = Number(temperatura_salida);
         if (isNaN(tempNum)) {
             return res.status(400).json({
-                error: 'El campo "temperatura_salida" debe ser numérico'
+                error: 'El campo "temperatura_salida" debe ser numÃ©rico'
             });
         }
         if (tempNum < -5 || tempNum > 45) {
             return res.status(400).json({
-                error: 'El campo "temperatura_salida" está fuera de rango (-5 a 45 °C)'
+                error: 'El campo "temperatura_salida" estÃ¡ fuera de rango (-5 a 45 Â°C)'
             });
         }
     }
@@ -138,7 +138,7 @@ export const validarDespacho = (req, res, next) => {
         });
     }
 
-    // ---- Normalización ----
+    // ---- NormalizaciÃ³n ----
     req.body.id_transporte = Number(id_transporte);
     req.body.id_cc = Number(id_cc);
     req.body.hora_salida = horaNorm;
@@ -150,7 +150,7 @@ export const validarDespacho = (req, res, next) => {
     req.body.cita = cita ? String(cita).trim().toUpperCase() : null;
     req.body.observaciones = observaciones ? String(observaciones).trim() : null;
 
-    // La inspección NO se captura en el encabezado: tiene su propio
+    // La inspecciÃ³n NO se captura en el encabezado: tiene su propio
     // endpoint. Se descarta para que el PUT no pueda aprobarla de paso.
     delete req.body.inocuidad;
     delete req.body.inocuidad_fecha;
@@ -161,18 +161,18 @@ export const validarDespacho = (req, res, next) => {
 };
 
 // ----------------------------------------------------------------------------
-// Inspección de inocuidad del despacho
+// InspecciÃ³n de inocuidad del despacho
 // ----------------------------------------------------------------------------
-// Resultado de revisar la caja en el andén ANTES de cargar: limpieza,
+// Resultado de revisar la caja en el andÃ©n ANTES de cargar: limpieza,
 // olores, plagas y estado de la unidad.
-//   1 = aprobada · 0 = rechazada
+//   1 = aprobada Â· 0 = rechazada
 //
-// ⚠️ NO hay valor por defecto. El middleware anterior de transportes
-// asumía 1 si el campo no venía: omitir el dato aprobaba la unidad. Aquí
-// una inspección no capturada es un 400, nunca una aprobación.
+// âš ï¸ NO hay valor por defecto. El middleware anterior de transportes
+// asumÃ­a 1 si el campo no venÃ­a: omitir el dato aprobaba la unidad. AquÃ­
+// una inspecciÃ³n no capturada es un 400, nunca una aprobaciÃ³n.
 //
 // El usuario y la fecha NO se reciben del body: el usuario sale de la
-// sesión (req.id_usuario) y la fecha la pone la BD.
+// sesiÃ³n (req.id_usuario) y la fecha la pone la BD.
 export const validarInocuidadDespacho = (req, res, next) => {
     const { inocuidad, inocuidad_observaciones } = req.body;
 
@@ -209,7 +209,7 @@ export const validarInocuidadDespacho = (req, res, next) => {
 };
 
 // ----------------------------------------------------------------------------
-// Línea del picking
+// LÃ­nea del picking
 // ----------------------------------------------------------------------------
 export const validarLinea = (req, res, next) => {
     const {
@@ -221,23 +221,23 @@ export const validarLinea = (req, res, next) => {
         observaciones
     } = req.body;
 
-    // ---- Ocupación de origen ----
-    // Obligatoria. El trigger puede deducir la cámara sin ella, pero
-    // entonces descontaría de "la activa de la cámara" con LIMIT 1, que es
-    // el montón equivocado en cuanto conviven varios procesos.
+    // ---- OcupaciÃ³n de origen ----
+    // Obligatoria. El trigger puede deducir la cÃ¡mara sin ella, pero
+    // entonces descontarÃ­a de "la activa de la cÃ¡mara" con LIMIT 1, que es
+    // el montÃ³n equivocado en cuanto conviven varios procesos.
     if (!id_ocupacion_origen || isNaN(Number(id_ocupacion_origen))) {
         return res.status(400).json({
-            error: 'El campo "id_ocupacion_origen" es obligatorio: indica de qué montón exacto sale la fruta'
+            error: 'El campo "id_ocupacion_origen" es obligatorio: indica de quÃ© montÃ³n exacto sale la fruta'
         });
     }
 
-    // ---- Bloque físico ----
+    // ---- Bloque fÃ­sico ----
     // Opcional: no toda la fruta se maneja en bloques armados.
     let bloqueNum = null;
     if (id_bloque !== undefined && id_bloque !== null && id_bloque !== "") {
         if (isNaN(Number(id_bloque))) {
             return res.status(400).json({
-                error: 'El campo "id_bloque" debe ser numérico o nulo'
+                error: 'El campo "id_bloque" debe ser numÃ©rico o nulo'
             });
         }
         bloqueNum = Number(id_bloque);
@@ -250,7 +250,7 @@ export const validarLinea = (req, res, next) => {
 
     if (isNaN(tarimas) || !Number.isInteger(tarimas) || tarimas < 0) {
         return res.status(400).json({
-            error: 'El campo "cantidad_tarimas" debe ser un número entero mayor o igual a 0'
+            error: 'El campo "cantidad_tarimas" debe ser un nÃºmero entero mayor o igual a 0'
         });
     }
 
@@ -260,17 +260,17 @@ export const validarLinea = (req, res, next) => {
 
     if (isNaN(cajas) || !Number.isInteger(cajas) || cajas < 0) {
         return res.status(400).json({
-            error: 'El campo "cantidad_cajas" debe ser un número entero mayor o igual a 0'
+            error: 'El campo "cantidad_cajas" debe ser un nÃºmero entero mayor o igual a 0'
         });
     }
 
     if (tarimas === 0 && cajas === 0) {
         return res.status(400).json({
-            error: "La línea debe llevar al menos una tarima o una caja"
+            error: "La lÃ­nea debe llevar al menos una tarima o una caja"
         });
     }
 
-    // Coherencia cajas ↔ tarimas. Mismo criterio que el resto del sistema.
+    // Coherencia cajas â†” tarimas. Mismo criterio que el resto del sistema.
     if (tarimas > 0 && cajas > 0) {
         if (tarimas > cajas) {
             return res.status(400).json({
@@ -280,23 +280,23 @@ export const validarLinea = (req, res, next) => {
 
         if (cajas > tarimas * 60) {
             return res.status(400).json({
-                error: `Revisa las cantidades: ${cajas} cajas no caben en ${tarimas} tarimas (máximo ~48 por tarima)`
+                error: `Revisa las cantidades: ${cajas} cajas no caben en ${tarimas} tarimas (mÃ¡ximo ~48 por tarima)`
             });
         }
     }
 
-    // ---- Temperatura de la línea ----
+    // ---- Temperatura de la lÃ­nea ----
     let tempNum = null;
     if (temperatura !== undefined && temperatura !== null && temperatura !== "") {
         tempNum = Number(temperatura);
         if (isNaN(tempNum)) {
             return res.status(400).json({
-                error: 'El campo "temperatura" debe ser numérico'
+                error: 'El campo "temperatura" debe ser numÃ©rico'
             });
         }
         if (tempNum < -5 || tempNum > 45) {
             return res.status(400).json({
-                error: 'El campo "temperatura" está fuera de rango (-5 a 45 °C)'
+                error: 'El campo "temperatura" estÃ¡ fuera de rango (-5 a 45 Â°C)'
             });
         }
     }
@@ -307,7 +307,7 @@ export const validarLinea = (req, res, next) => {
         });
     }
 
-    // ---- Normalización ----
+    // ---- NormalizaciÃ³n ----
     req.body.id_ocupacion_origen = Number(id_ocupacion_origen);
     req.body.id_bloque = bloqueNum;
     req.body.cantidad_tarimas = tarimas;
@@ -319,11 +319,11 @@ export const validarLinea = (req, res, next) => {
 };
 
 // ----------------------------------------------------------------------------
-// Motivo de corrección
+// Motivo de correcciÃ³n
 // ----------------------------------------------------------------------------
 // Se exige al editar un despacho CERRADO o al reabrirlo. Sin motivo, la
-// tabla de auditoría no sirve de nada: seis meses después nadie recuerda
-// por qué se tocó un documento que ya había salido.
+// tabla de auditorÃ­a no sirve de nada: seis meses despuÃ©s nadie recuerda
+// por quÃ© se tocÃ³ un documento que ya habÃ­a salido.
 export const validarMotivo = (req, res, next) => {
     const { motivo } = req.body;
 
@@ -335,7 +335,7 @@ export const validarMotivo = (req, res, next) => {
 
     if (motivo.trim().length < 10) {
         return res.status(400).json({
-            error: 'El campo "motivo" debe explicar la corrección: usa al menos 10 caracteres'
+            error: 'El campo "motivo" debe explicar la correcciÃ³n: usa al menos 10 caracteres'
         });
     }
 
@@ -354,7 +354,7 @@ export const validarIdDespacho = (req, res, next) => {
 
     if (!id || isNaN(Number(id))) {
         return res.status(400).json({
-            error: "El id de despacho debe ser un número válido"
+            error: "El id de despacho debe ser un nÃºmero vÃ¡lido"
         });
     }
 
@@ -366,7 +366,7 @@ export const validarIdDetalle = (req, res, next) => {
 
     if (!id_detalle || isNaN(Number(id_detalle))) {
         return res.status(400).json({
-            error: "El id de la línea debe ser un número válido"
+            error: "El id de la lÃ­nea debe ser un nÃºmero vÃ¡lido"
         });
     }
 

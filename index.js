@@ -56,6 +56,8 @@ import mantenimientosRouter from "./routes/mantenimientos.route.js";
 import evidenciasRouter from "./routes/evidencias.route.js";
 import bajasRouter from "./routes/bajas.route.js";
 import produccionImportacionRouter from "./routes/produccionImportacion.route.js";
+import tarimasRouter from "./routes/tarimas.route.js";
+
 // ============================================================================
 // VERIFICACIÓN DE ARRANQUE
 // ============================================================================
@@ -141,6 +143,7 @@ app.use(`${API}/bloques`, bloquesRouter);
 app.use(`${API}/pulpeos`, pulpeosRouter);
 app.use(`${API}/mantenimientos`, mantenimientosRouter);
 app.use(`${API}/produccion-importacion`, produccionImportacionRouter);
+app.use(`${API}/tarimas`, tarimasRouter);
 
 // ---- v3.0 ----
 // Fotos y videos de despachos y pulpeos, almacenados en SharePoint

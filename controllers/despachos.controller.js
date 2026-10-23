@@ -10,52 +10,52 @@ import cedisModel from "../models/cedis.model.js";
 //     null  -> Admin / Coordinador
 //     [...] -> Supervisor / Operativo
 //
-// ⚠️ ESTE CONTROLLER NO TOCA ocupaciones_camaras
-//   Agregar una línea dispara trg_despacho_detalle_movimiento, que crea el
+// âš ï¸ ESTE CONTROLLER NO TOCA ocupaciones_camaras
+//   Agregar una lÃ­nea dispara trg_despacho_detalle_movimiento, que crea el
 //   movimiento tipo 3; ese movimiento dispara el trigger que descuenta la
-//   cámara. Una sola vía de descuento.
+//   cÃ¡mara. Una sola vÃ­a de descuento.
 //
-//   Quitar una línea llama a fn_quitar_linea_despacho, que borra la línea y
+//   Quitar una lÃ­nea llama a fn_quitar_linea_despacho, que borra la lÃ­nea y
 //   su movimiento; trg_revertir_movimiento (v2.5) devuelve la fruta. Una
-//   sola vía de reversa: desde la v2.5 recepciones, movimientos y
-//   mantenimientos también tienen la suya en la BD.
+//   sola vÃ­a de reversa: desde la v2.5 recepciones, movimientos y
+//   mantenimientos tambiÃ©n tienen la suya en la BD.
 //
-// ⚠️ LA FUNCIÓN DE REVERSA DEVUELVE TEXTO, NO EXCEPCIÓN
+// âš ï¸ LA FUNCIÃ“N DE REVERSA DEVUELVE TEXTO, NO EXCEPCIÃ“N
 //   fn_quitar_linea_despacho regresa 'OK: ...' o el motivo del rechazo. Sin
-//   leer el prefijo, un fallo respondería 200 y el operador creería que la
-//   fruta volvió a la cámara cuando sigue cargada en el camión.
+//   leer el prefijo, un fallo responderÃ­a 200 y el operador creerÃ­a que la
+//   fruta volviÃ³ a la cÃ¡mara cuando sigue cargada en el camiÃ³n.
 //
-// ⚠️ LA INOCUIDAD ES DEL DESPACHO, NO DEL TRANSPORTE
+// âš ï¸ LA INOCUIDAD ES DEL DESPACHO, NO DEL TRANSPORTE
 //   Se registra con PATCH /:id/inocuidad sobre el borrador. El cierre exige
 //   despachos.inocuidad = 1; ya no consulta transportes.inocuidad. Si el
-//   borrador cambia de transporte, la BD borra la inspección y hay que
+//   borrador cambia de transporte, la BD borra la inspecciÃ³n y hay que
 //   volver a revisar la nueva caja.
 //
-// ⚠️ LOS TRIGGERS DE LA BD SON LA ÚLTIMA PALABRA
+// âš ï¸ LOS TRIGGERS DE LA BD SON LA ÃšLTIMA PALABRA
 //   trg_validar_cierre y los de inventario lanzan excepciones (P0001) con
-//   mensajes ya legibles. Se devuelven como 409 en vez de un 500 genérico.
+//   mensajes ya legibles. Se devuelven como 409 en vez de un 500 genÃ©rico.
 //
-// EL ALCANCE SOBRE UN DOCUMENTO SIN CÁMARA
-//   El despacho no tiene cámara: la tienen sus líneas. Un despacho ya
-//   armado pertenece a quien puso la fruta; uno vacío todavía no tiene
-//   planta asignada, así que cualquiera puede continuarlo.
+// EL ALCANCE SOBRE UN DOCUMENTO SIN CÃMARA
+//   El despacho no tiene cÃ¡mara: la tienen sus lÃ­neas. Un despacho ya
+//   armado pertenece a quien puso la fruta; uno vacÃ­o todavÃ­a no tiene
+//   planta asignada, asÃ­ que cualquiera puede continuarlo.
 //
-// NOTA DE LA AUDITORÍA
-//   El aviso de "fruta planeada para otro cliente" al agregar una línea no
-//   salía nunca: ocupacionesModel.getOcupacionById no devolvía id_cc. Se
-//   corrigió en el model (primera entrega); este controller no cambió su
-//   lógica, solo sus comentarios.
+// NOTA DE LA AUDITORÃA
+//   El aviso de "fruta planeada para otro cliente" al agregar una lÃ­nea no
+//   salÃ­a nunca: ocupacionesModel.getOcupacionById no devolvÃ­a id_cc. Se
+//   corrigiÃ³ en el model (primera entrega); este controller no cambiÃ³ su
+//   lÃ³gica, solo sus comentarios.
 // ============================================================================
 
-/** fn_quitar_linea_despacho marca el éxito con este prefijo. */
+/** fn_quitar_linea_despacho marca el Ã©xito con este prefijo. */
 const esExito = (respuesta) => String(respuesta).startsWith("OK:");
 
 /**
- * Errores que vienen de la BD con un mensaje útil para el usuario.
- * Devuelve true si ya respondió.
+ * Errores que vienen de la BD con un mensaje Ãºtil para el usuario.
+ * Devuelve true si ya respondiÃ³.
  */
 const responderErrorBD = (res, error) => {
-    // RAISE EXCEPTION de los triggers: el mensaje ya está en español
+    // RAISE EXCEPTION de los triggers: el mensaje ya estÃ¡ en espaÃ±ol
     if (error.code === "P0001") {
         res.status(409).json({ error: error.message });
         return true;
@@ -63,7 +63,7 @@ const responderErrorBD = (res, error) => {
     // CHECK violado (p. ej. chk_despachos_inocuidad_revision)
     if (error.code === "23514") {
         res.status(409).json({
-            error: "La BD rechazó el dato por una regla de integridad" +
+            error: "La BD rechazÃ³ el dato por una regla de integridad" +
                 (error.constraint ? ` (${error.constraint})` : "")
         });
         return true;
@@ -75,7 +75,7 @@ const responderErrorBD = (res, error) => {
  * Valida que el usuario tenga acceso a un despacho ya armado.
  * Devuelve un objeto de error listo para responder, o null si todo cuadra.
  *
- * Un despacho sin líneas pasa siempre: no tiene cámara que comparar.
+ * Un despacho sin lÃ­neas pasa siempre: no tiene cÃ¡mara que comparar.
  */
 const validarAlcanceDespacho = async (id_despacho, camaras) => {
     if (!Array.isArray(camaras)) return null;
@@ -84,7 +84,7 @@ const validarAlcanceDespacho = async (id_despacho, camaras) => {
         id_despacho
     );
 
-    // Borrador vacío: sin fruta todavía, no hay planta que proteger
+    // Borrador vacÃ­o: sin fruta todavÃ­a, no hay planta que proteger
     if (camarasDelDespacho.length === 0) return null;
 
     const tieneAcceso = camarasDelDespacho.some((c) => camaras.includes(c));
@@ -92,7 +92,7 @@ const validarAlcanceDespacho = async (id_despacho, camaras) => {
     if (!tieneAcceso) {
         return {
             status: 403,
-            error: "No tienes acceso a ese despacho: su fruta salió de otras cámaras"
+            error: "No tienes acceso a ese despacho: su fruta saliÃ³ de otras cÃ¡maras"
         };
     }
 
@@ -101,11 +101,11 @@ const validarAlcanceDespacho = async (id_despacho, camaras) => {
 
 /**
  * Valida que un transporte pueda asignarse a un despacho.
- * Devuelve { status, error } si no puede, o { transporte } si sí.
+ * Devuelve { status, error } si no puede, o { transporte } si sÃ­.
  *
- * Desde la etapa de catálogos, el servicio debe tener sus cuatro piezas
- * (línea, operador, tracto, caja) y todas activas: sin ellas, la BD no
- * deja registrar la inspección y el despacho nunca podría cerrarse.
+ * Desde la etapa de catÃ¡logos, el servicio debe tener sus cuatro piezas
+ * (lÃ­nea, operador, tracto, caja) y todas activas: sin ellas, la BD no
+ * deja registrar la inspecciÃ³n y el despacho nunca podrÃ­a cerrarse.
  */
 const validarTransporteParaDespacho = async (id_transporte) => {
     const transporte = await transportesModel.getTransporteById(id_transporte);
@@ -117,21 +117,21 @@ const validarTransporteParaDespacho = async (id_transporte) => {
     if (Number(transporte.estado) === 0) {
         return {
             status: 409,
-            error: `El transporte "${transporte.razon_social} - ${transporte.nombre_operador}" está dado de baja`
+            error: `El transporte "${transporte.razon_social} - ${transporte.nombre_operador}" estÃ¡ dado de baja`
         };
     }
 
     if (!transporte.catalogos_completos) {
         return {
             status: 409,
-            error: `El transporte #${transporte.id_transporte} es un registro anterior sin línea, operador, tracto y caja de catálogo. Vincúlalo en el catálogo de transportes antes de usarlo.`
+            error: `El transporte #${transporte.id_transporte} es un registro anterior sin lÃ­nea, operador, tracto y caja de catÃ¡logo. VincÃºlalo en el catÃ¡logo de transportes antes de usarlo.`
         };
     }
 
     if (!transporte.catalogos_activos) {
         return {
             status: 409,
-            error: `Alguna pieza del transporte #${transporte.id_transporte} (línea, operador, tracto o caja) está dada de baja. Elige otro servicio.`
+            error: `Alguna pieza del transporte #${transporte.id_transporte} (lÃ­nea, operador, tracto o caja) estÃ¡ dada de baja. Elige otro servicio.`
         };
     }
 
@@ -179,7 +179,7 @@ const getDespachos = async (req, res) => {
 };
 
 // GET /api/preenfrio/despachos/:id
-// Devuelve el documento con su picking completo y su auditoría.
+// Devuelve el documento con su picking completo y su auditorÃ­a.
 const getDespachoById = async (req, res) => {
     try {
         const { id } = req.params;
@@ -203,7 +203,7 @@ const getDespachoById = async (req, res) => {
             ...despacho,
             detalle,
             auditoria,
-            // Líneas cuyo cliente no coincide con el del documento: el
+            // LÃ­neas cuyo cliente no coincide con el del documento: el
             // error que cuesta un viaje completo si nadie lo revisa.
             lineas_de_otro_cliente: descuadres
         });
@@ -215,7 +215,7 @@ const getDespachoById = async (req, res) => {
 
 // GET /api/preenfrio/despachos/clientes-disponibles
 // Dropdown del picking: solo clientes que REALMENTE tienen fruta en las
-// cámaras del alcance, ordenados por criticidad.
+// cÃ¡maras del alcance, ordenados por criticidad.
 const getClientesDisponibles = async (req, res) => {
     try {
         const clientes = await despachosModel.getClientesConInventario(req.camaras);
@@ -230,8 +230,8 @@ const getClientesDisponibles = async (req, res) => {
 // Fruta que se puede subir a este despacho. Filtra por el cliente del
 // documento, porque es lo que normalmente se carga.
 //
-//   ?todos=1 → muestra también fruta de otros clientes, para los casos de
-//              reasignación. Viene marcada para que no pase inadvertida.
+//   ?todos=1 â†’ muestra tambiÃ©n fruta de otros clientes, para los casos de
+//              reasignaciÃ³n. Viene marcada para que no pase inadvertida.
 const getDisponible = async (req, res) => {
     try {
         const { id } = req.params;
@@ -245,7 +245,7 @@ const getDisponible = async (req, res) => {
 
         // Mismo criterio que el resto de acciones sobre el documento: un
         // despacho armado con fruta de otra planta no se consulta desde
-        // aquí. Antes esta ruta devolvía su encabezado sin revisarlo.
+        // aquÃ­. Antes esta ruta devolvÃ­a su encabezado sin revisarlo.
         const problema = await validarAlcanceDespacho(id, req.camaras);
         if (problema) {
             return res.status(problema.status).json({ error: problema.error });
@@ -268,7 +268,7 @@ const getDisponible = async (req, res) => {
             inventario: disponible.map((f) => ({
                 ...f,
                 // Marca visible cuando se listan todos: subir fruta de otro
-                // cliente es legítimo pero tiene que ser una decisión, no
+                // cliente es legÃ­timo pero tiene que ser una decisiÃ³n, no
                 // un descuido.
                 es_de_otro_cliente: Number(f.id_cc) !== Number(despacho.id_cc)
             }))
@@ -282,7 +282,7 @@ const getDisponible = async (req, res) => {
 // ----------------------------------------------------------------------------
 // POST /api/preenfrio/despachos
 // ----------------------------------------------------------------------------
-// Crea el documento en borrador, con la inspección PENDIENTE. El folio lo
+// Crea el documento en borrador, con la inspecciÃ³n PENDIENTE. El folio lo
 // genera la BD con la secuencia, no el backend.
 const createDespacho = async (req, res) => {
     try {
@@ -303,17 +303,17 @@ const createDespacho = async (req, res) => {
 
         if (cliente.estado === 0) {
             return res.status(409).json({
-                error: `El destino "${cliente.cliente} - ${cliente.cedis}" está dado de baja`
+                error: `El destino "${cliente.cliente} - ${cliente.cedis}" estÃ¡ dado de baja`
             });
         }
 
         const nuevo = await despachosModel.createDespacho(req.body);
         const completo = await despachosModel.getDespachoById(nuevo.id_despacho);
 
-        // La inspección se avisa al crear y se BLOQUEA al cerrar. Avisar
+        // La inspecciÃ³n se avisa al crear y se BLOQUEA al cerrar. Avisar
         // desde el borrador da tiempo de revisar la caja antes de cargar.
         const avisos = [
-            `Inspección de inocuidad PENDIENTE para la caja ${completo.placas_caja}. Regístrala antes de cerrar el despacho.`
+            `InspecciÃ³n de inocuidad PENDIENTE para la caja ${completo.placas_caja}. RegÃ­strala antes de cerrar el despacho.`
         ];
 
         res.status(201).json({
@@ -342,13 +342,13 @@ const createDespacho = async (req, res) => {
 // ----------------------------------------------------------------------------
 // PUT /api/preenfrio/despachos/:id
 // ----------------------------------------------------------------------------
-// Editar el encabezado. Si el despacho está CERRADO exige motivo y registra
-// auditoría: el camión ya salió, así que cualquier cambio es una corrección
-// administrativa que alguien tendrá que justificar después.
+// Editar el encabezado. Si el despacho estÃ¡ CERRADO exige motivo y registra
+// auditorÃ­a: el camiÃ³n ya saliÃ³, asÃ­ que cualquier cambio es una correcciÃ³n
+// administrativa que alguien tendrÃ¡ que justificar despuÃ©s.
 //
-// ⚠️ TRANSPORTE
-//   · Borrador: se puede cambiar, pero la BD BORRA la inspección. Se avisa.
-//   · Cerrado:  no se puede cambiar. Hay que reabrir primero (admin).
+// âš ï¸ TRANSPORTE
+//   Â· Borrador: se puede cambiar, pero la BD BORRA la inspecciÃ³n. Se avisa.
+//   Â· Cerrado:  no se puede cambiar. Hay que reabrir primero (admin).
 const updateDespacho = async (req, res) => {
     try {
         const { id } = req.params;
@@ -370,20 +370,20 @@ const updateDespacho = async (req, res) => {
             Number(id_transporte) !== Number(existente.id_transporte);
 
         // El middleware validarMotivo se encadena solo en la ruta de
-        // corrección; aquí se verifica por si se llamó al PUT normal sobre
+        // correcciÃ³n; aquÃ­ se verifica por si se llamÃ³ al PUT normal sobre
         // un documento ya cerrado.
         if (estabaCerrado && (!motivo || String(motivo).trim().length < 10)) {
             return res.status(409).json({
-                error: "El despacho ya está cerrado. Para corregirlo debes indicar un motivo de al menos 10 caracteres."
+                error: "El despacho ya estÃ¡ cerrado. Para corregirlo debes indicar un motivo de al menos 10 caracteres."
             });
         }
 
-        // Un despacho cerrado salió con una caja inspeccionada: cambiar el
-        // transporte dejaría esa inspección ligada a otra unidad. La BD lo
-        // rechaza (trg_validar_cierre); aquí se responde claro.
+        // Un despacho cerrado saliÃ³ con una caja inspeccionada: cambiar el
+        // transporte dejarÃ­a esa inspecciÃ³n ligada a otra unidad. La BD lo
+        // rechaza (trg_validar_cierre); aquÃ­ se responde claro.
         if (estabaCerrado && cambiaTransporte) {
             return res.status(409).json({
-                error: "No se puede cambiar el transporte de un despacho cerrado. Reabre primero el despacho (admin) y vuelve a registrar la inspección."
+                error: "No se puede cambiar el transporte de un despacho cerrado. Reabre primero el despacho (admin) y vuelve a registrar la inspecciÃ³n."
             });
         }
 
@@ -397,11 +397,11 @@ const updateDespacho = async (req, res) => {
         await despachosModel.updateDespacho(id, req.body);
         const completo = await despachosModel.getDespachoById(id);
 
-        // ---- Auditoría de la corrección ----
+        // ---- AuditorÃ­a de la correcciÃ³n ----
         if (estabaCerrado) {
-            // Snapshot legible de lo que cambió: 'Cita: A123 → A124'.
-            // Guardar el JSON completo sería más fiel pero ilegible para
-            // quien audite meses después.
+            // Snapshot legible de lo que cambiÃ³: 'Cita: A123 â†’ A124'.
+            // Guardar el JSON completo serÃ­a mÃ¡s fiel pero ilegible para
+            // quien audite meses despuÃ©s.
             const campos = [
                 ["Transporte", existente.id_transporte, completo.id_transporte],
                 ["Cliente", existente.id_cc, completo.id_cc],
@@ -419,7 +419,7 @@ const updateDespacho = async (req, res) => {
 
             const cambios = campos
                 .filter(([, antes, despues]) => String(antes) !== String(despues))
-                .map(([campo, antes, despues]) => `${campo}: ${antes} → ${despues}`)
+                .map(([campo, antes, despues]) => `${campo}: ${antes} â†’ ${despues}`)
                 .join("; ");
 
             await despachosModel.registrarAuditoria({
@@ -434,13 +434,13 @@ const updateDespacho = async (req, res) => {
         const avisos = [];
         if (cambiaTransporte && existente.inocuidad !== null) {
             avisos.push(
-                `Cambió el transporte: la inspección anterior se borró. Registra la inocuidad de la caja ${completo.placas_caja} antes de cerrar.`
+                `CambiÃ³ el transporte: la inspecciÃ³n anterior se borrÃ³. Registra la inocuidad de la caja ${completo.placas_caja} antes de cerrar.`
             );
         }
 
         res.status(200).json({
             mensaje: estabaCerrado
-                ? "Corrección registrada en la auditoría del despacho"
+                ? "CorrecciÃ³n registrada en la auditorÃ­a del despacho"
                 : "Despacho actualizado",
             despacho: completo,
             avisos
@@ -457,14 +457,14 @@ const updateDespacho = async (req, res) => {
 // ----------------------------------------------------------------------------
 // PATCH /api/preenfrio/despachos/:id/inocuidad
 // ----------------------------------------------------------------------------
-// Registra la inspección de la caja para ESTE despacho. Es la decisión que
-// el supervisor toma en el andén con la unidad enfrente.
+// Registra la inspecciÃ³n de la caja para ESTE despacho. Es la decisiÃ³n que
+// el supervisor toma en el andÃ©n con la unidad enfrente.
 //
-//   · Solo en borrador: un despacho cerrado ya salió con la inspección que
-//     tenía. Para cambiarla hay que reabrirlo (admin, auditado).
-//   · El usuario es el de la sesión; la fecha la pone la BD.
-//   · Se puede volver a inspeccionar: un rechazo se corrige lavando la caja
-//     y registrando una nueva revisión.
+//   Â· Solo en borrador: un despacho cerrado ya saliÃ³ con la inspecciÃ³n que
+//     tenÃ­a. Para cambiarla hay que reabrirlo (admin, auditado).
+//   Â· El usuario es el de la sesiÃ³n; la fecha la pone la BD.
+//   Â· Se puede volver a inspeccionar: un rechazo se corrige lavando la caja
+//     y registrando una nueva revisiÃ³n.
 const registrarInocuidad = async (req, res) => {
     try {
         const { id } = req.params;
@@ -472,7 +472,7 @@ const registrarInocuidad = async (req, res) => {
 
         if (!req.id_usuario) {
             return res.status(401).json({
-                error: "No se pudo identificar al usuario de la sesión"
+                error: "No se pudo identificar al usuario de la sesiÃ³n"
             });
         }
 
@@ -489,18 +489,18 @@ const registrarInocuidad = async (req, res) => {
 
         if (Number(despacho.estado) === 2) {
             return res.status(409).json({
-                error: `El despacho ${despacho.folio_despacho} ya está cerrado: su inspección no se modifica. Reábrelo primero si fue un error.`
+                error: `El despacho ${despacho.folio_despacho} ya estÃ¡ cerrado: su inspecciÃ³n no se modifica. ReÃ¡brelo primero si fue un error.`
             });
         }
 
-        // La BD exige los cuatro catálogos del transporte para registrar
-        // la inspección. Se revisa antes para dar un mensaje útil.
+        // La BD exige los cuatro catÃ¡logos del transporte para registrar
+        // la inspecciÃ³n. Se revisa antes para dar un mensaje Ãºtil.
         const transporte = await transportesModel.getTransporteById(
             despacho.id_transporte
         );
         if (!transporte || !transporte.catalogos_completos) {
             return res.status(409).json({
-                error: "El transporte de este despacho no tiene sus cuatro catálogos (línea, operador, tracto y caja). Cambia el servicio antes de inspeccionar."
+                error: "El transporte de este despacho no tiene sus cuatro catÃ¡logos (lÃ­nea, operador, tracto y caja). Cambia el servicio antes de inspeccionar."
             });
         }
 
@@ -510,10 +510,10 @@ const registrarInocuidad = async (req, res) => {
             observaciones: inocuidad_observaciones
         });
 
-        // Se cerró entre la lectura y el UPDATE
+        // Se cerrÃ³ entre la lectura y el UPDATE
         if (!actualizado) {
             return res.status(409).json({
-                error: "El despacho ya no está en borrador: no se registró la inspección"
+                error: "El despacho ya no estÃ¡ en borrador: no se registrÃ³ la inspecciÃ³n"
             });
         }
 
@@ -532,11 +532,11 @@ const registrarInocuidad = async (req, res) => {
 
         if (error.code === "23503") {
             return res.status(409).json({
-                error: "El usuario de la sesión no existe en la BD"
+                error: "El usuario de la sesiÃ³n no existe en la BD"
             });
         }
 
-        res.status(500).json({ error: "Error al registrar la inspección de inocuidad" });
+        res.status(500).json({ error: "Error al registrar la inspecciÃ³n de inocuidad" });
     }
 };
 
@@ -544,7 +544,7 @@ const registrarInocuidad = async (req, res) => {
 // POST /api/preenfrio/despachos/:id/lineas
 // ----------------------------------------------------------------------------
 // Agregar fruta al picking. El INSERT dispara la cadena de triggers que
-// descuenta la cámara.
+// descuenta la cÃ¡mara.
 const agregarLinea = async (req, res) => {
     try {
         const { id } = req.params;
@@ -560,49 +560,49 @@ const agregarLinea = async (req, res) => {
             return res.status(404).json({ error: "Despacho no encontrado" });
         }
 
-        // Un despacho cerrado ya salió: agregarle fruta descontaría una
-        // cámara por producto que nunca se subió al camión.
+        // Un despacho cerrado ya saliÃ³: agregarle fruta descontarÃ­a una
+        // cÃ¡mara por producto que nunca se subiÃ³ al camiÃ³n.
         if (Number(despacho.estado) === 2) {
             return res.status(409).json({
-                error: `El despacho ${despacho.folio_despacho} ya está cerrado: no se le puede agregar fruta.`
+                error: `El despacho ${despacho.folio_despacho} ya estÃ¡ cerrado: no se le puede agregar fruta.`
             });
         }
 
-        // ---- La ocupación de origen ----
+        // ---- La ocupaciÃ³n de origen ----
         const origen = await ocupacionesModel.getOcupacionById(id_ocupacion_origen);
 
         if (!origen) {
-            return res.status(409).json({ error: "La ocupación de origen no existe" });
+            return res.status(409).json({ error: "La ocupaciÃ³n de origen no existe" });
         }
 
         if (origen.estado !== 1) {
             return res.status(409).json({
-                error: "Esa ocupación ya está cerrada: no queda fruta que despachar"
+                error: "Esa ocupaciÃ³n ya estÃ¡ cerrada: no queda fruta que despachar"
             });
         }
 
-        // Solo se despacha lo que está DENTRO. La cola sigue en el patio.
+        // Solo se despacha lo que estÃ¡ DENTRO. La cola sigue en el patio.
         if (origen.tipo_ocupacion !== 1) {
             return res.status(409).json({
-                error: `Esa ocupación es "${origen.tipo_texto}". Solo se puede despachar fruta que ya está dentro de la cámara.`
+                error: `Esa ocupaciÃ³n es "${origen.tipo_texto}". Solo se puede despachar fruta que ya estÃ¡ dentro de la cÃ¡mara.`
             });
         }
 
-        // ---- Alcance sobre la cámara de origen ----
-        // No viene en el body: se deduce de la ocupación, así que
+        // ---- Alcance sobre la cÃ¡mara de origen ----
+        // No viene en el body: se deduce de la ocupaciÃ³n, asÃ­ que
         // validarCamaraEnAlcance no puede verla.
         if (
             Array.isArray(req.camaras) &&
             !req.camaras.includes(Number(origen.id_camara))
         ) {
             return res.status(403).json({
-                error: "No tienes acceso a la cámara de origen de esa fruta"
+                error: "No tienes acceso a la cÃ¡mara de origen de esa fruta"
             });
         }
 
-        // ---- No se puede subir más de lo que hay ----
-        // La BD también lo rechaza, pero aquí se responde con el nombre de
-        // la cámara y el saldo exacto del lote.
+        // ---- No se puede subir mÃ¡s de lo que hay ----
+        // La BD tambiÃ©n lo rechaza, pero aquÃ­ se responde con el nombre de
+        // la cÃ¡mara y el saldo exacto del lote.
         if (Number(cantidad_tarimas) > Number(origen.cantidad_tarimas)) {
             return res.status(409).json({
                 error: `No puedes despachar ${cantidad_tarimas} tarimas: en "${origen.nombre_camara}" solo hay ${origen.cantidad_tarimas} de este lote.`
@@ -616,8 +616,8 @@ const agregarLinea = async (req, res) => {
         }
 
         // ---- INSERT ----
-        // id_produccion e id_camara_origen salen de la ocupación: el
-        // trigger también los deduciría, pero dejarlos explícitos hace el
+        // id_produccion e id_camara_origen salen de la ocupaciÃ³n: el
+        // trigger tambiÃ©n los deducirÃ­a, pero dejarlos explÃ­citos hace el
         // registro legible y evita depender de ese detalle.
         const linea = await despachosModel.agregarLinea({
             ...req.body,
@@ -626,7 +626,7 @@ const agregarLinea = async (req, res) => {
             id_camara_origen: origen.id_camara
         });
 
-        // ---- Qué quedó después ----
+        // ---- QuÃ© quedÃ³ despuÃ©s ----
         const completa = await despachosModel.getLineaById(linea.id_detalle);
         const origenDespues = await ocupacionesModel.getOcupacionById(
             id_ocupacion_origen
@@ -635,22 +635,22 @@ const agregarLinea = async (req, res) => {
 
         const avisos = [];
 
-        // Fruta de otro cliente: legítimo cuando se reasigna, pero es el
+        // Fruta de otro cliente: legÃ­timo cuando se reasigna, pero es el
         // error que cuesta el viaje completo si pasa inadvertido. Se avisa
-        // aquí y se bloquea al cerrar.
+        // aquÃ­ y se bloquea al cerrar.
         if (origen.id_cc && Number(origen.id_cc) !== Number(despacho.id_cc)) {
             avisos.push(
-                `⚠️ Este lote estaba planeado para ${origen.cliente} - ${origen.cedis}, y el despacho va a ${despacho.cliente} - ${despacho.cedis}. Verifica que la reasignación sea correcta.`
+                `âš ï¸ Este lote estaba planeado para ${origen.cliente} - ${origen.cedis}, y el despacho va a ${despacho.cliente} - ${despacho.cedis}. Verifica que la reasignaciÃ³n sea correcta.`
             );
         }
 
         // Cargar antes de inspeccionar es posible, pero el cierre lo va a
-        // bloquear: se recuerda desde la primera línea.
+        // bloquear: se recuerda desde la primera lÃ­nea.
         if (Number(despachoActualizado.inocuidad) !== 1) {
             avisos.push(
                 despachoActualizado.inocuidad === null
-                    ? "Inspección de inocuidad PENDIENTE: regístrala antes de cerrar."
-                    : "⚠️ La inspección de inocuidad de esta caja está RECHAZADA: no podrás cerrar el despacho."
+                    ? "InspecciÃ³n de inocuidad PENDIENTE: regÃ­strala antes de cerrar."
+                    : "âš ï¸ La inspecciÃ³n de inocuidad de esta caja estÃ¡ RECHAZADA: no podrÃ¡s cerrar el despacho."
             );
         }
 
@@ -659,11 +659,11 @@ const agregarLinea = async (req, res) => {
             linea: completa,
             origen: {
                 camara: origen.nombre_camara,
-                // El trigger cierra la ocupación si quedó en cero
+                // El trigger cierra la ocupaciÃ³n si quedÃ³ en cero
                 tarimas_restantes: origenDespues?.cantidad_tarimas ?? 0,
                 cerrada: origenDespues?.estado === 0
             },
-            // Los totales los recalculó trg_recalcular_totales_despacho
+            // Los totales los recalculÃ³ trg_recalcular_totales_despacho
             totales: {
                 tarimas: despachoActualizado.cantidad_tarimas,
                 cajas: despachoActualizado.cantidad_cajas,
@@ -678,12 +678,12 @@ const agregarLinea = async (req, res) => {
 
         if (error.code === "23503") {
             return res.status(409).json({
-                error: "La ocupación, el bloque o el despacho indicados no existen"
+                error: "La ocupaciÃ³n, el bloque o el despacho indicados no existen"
             });
         }
 
         res.status(500).json({
-            error: "Error al agregar la línea" +
+            error: "Error al agregar la lÃ­nea" +
                 (error.message ? `: ${error.message}` : "")
         });
     }
@@ -693,9 +693,9 @@ const agregarLinea = async (req, res) => {
 // DELETE /api/preenfrio/despachos/:id/lineas/:id_detalle
 // ----------------------------------------------------------------------------
 // Llama a fn_quitar_linea_despacho: verifica que el despacho siga en
-// borrador, borra la línea y su movimiento. Al borrar el movimiento,
-// trg_revertir_movimiento devuelve la fruta a su cámara y reabre la
-// ocupación si se había cerrado.
+// borrador, borra la lÃ­nea y su movimiento. Al borrar el movimiento,
+// trg_revertir_movimiento devuelve la fruta a su cÃ¡mara y reabre la
+// ocupaciÃ³n si se habÃ­a cerrado.
 const quitarLinea = async (req, res) => {
     try {
         const { id, id_detalle } = req.params;
@@ -709,32 +709,32 @@ const quitarLinea = async (req, res) => {
         const linea = await despachosModel.getLineaById(id_detalle);
 
         if (!linea) {
-            return res.status(404).json({ error: "Línea no encontrada" });
+            return res.status(404).json({ error: "LÃ­nea no encontrada" });
         }
 
         if (Number(linea.id_despacho) !== Number(id)) {
             return res.status(409).json({
-                error: "Esa línea no pertenece a este despacho"
+                error: "Esa lÃ­nea no pertenece a este despacho"
             });
         }
 
-        // Alcance sobre la cámara de donde salió la fruta
+        // Alcance sobre la cÃ¡mara de donde saliÃ³ la fruta
         if (
             Array.isArray(req.camaras) &&
             linea.id_camara_origen !== null &&
             !req.camaras.includes(Number(linea.id_camara_origen))
         ) {
             return res.status(403).json({
-                error: "No tienes acceso a la cámara de origen de esa línea"
+                error: "No tienes acceso a la cÃ¡mara de origen de esa lÃ­nea"
             });
         }
 
-        // ---- Llamada a la función de reversa ----
+        // ---- Llamada a la funciÃ³n de reversa ----
         const resultado = await despachosModel.quitarLinea(id_detalle);
 
-        // ⚠️ Devuelve TEXTO, no excepción. Sin esta comprobación, intentar
-        // quitar una línea de un despacho cerrado respondería 200 y el
-        // operador creería que la fruta volvió a la cámara.
+        // âš ï¸ Devuelve TEXTO, no excepciÃ³n. Sin esta comprobaciÃ³n, intentar
+        // quitar una lÃ­nea de un despacho cerrado responderÃ­a 200 y el
+        // operador creerÃ­a que la fruta volviÃ³ a la cÃ¡mara.
         if (!esExito(resultado)) {
             return res.status(409).json({ error: resultado });
         }
@@ -756,15 +756,15 @@ const quitarLinea = async (req, res) => {
 
         if (responderErrorBD(res, error)) return;
 
-        res.status(500).json({ error: "Error al quitar la línea" });
+        res.status(500).json({ error: "Error al quitar la lÃ­nea" });
     }
 };
 
 // ----------------------------------------------------------------------------
 // PATCH /api/preenfrio/despachos/:id/cerrar
 // ----------------------------------------------------------------------------
-// El camión salió. Es el punto donde se aplican los bloqueos duros: después
-// de cerrar, corregir cuesta auditoría.
+// El camiÃ³n saliÃ³. Es el punto donde se aplican los bloqueos duros: despuÃ©s
+// de cerrar, corregir cuesta auditorÃ­a.
 const cerrarDespacho = async (req, res) => {
     try {
         const { id } = req.params;
@@ -782,23 +782,23 @@ const cerrarDespacho = async (req, res) => {
 
         if (Number(despacho.estado) === 2) {
             return res.status(409).json({
-                error: "El despacho ya está cerrado"
+                error: "El despacho ya estÃ¡ cerrado"
             });
         }
 
         // ---- Sin fruta no hay despacho ----
         if (Number(despacho.lineas) === 0) {
             return res.status(409).json({
-                error: "No puedes cerrar un despacho sin líneas de picking"
+                error: "No puedes cerrar un despacho sin lÃ­neas de picking"
             });
         }
 
         // ---- Inocuidad DEL DESPACHO: bloqueo duro ----
         // Ya no se consulta transportes.inocuidad: cada despacho exige su
-        // propia inspección aprobada.
+        // propia inspecciÃ³n aprobada.
         if (despacho.inocuidad === null) {
             return res.status(409).json({
-                error: `La inspección de inocuidad de la caja ${despacho.placas_caja} está PENDIENTE. Regístrala antes de cerrar.`
+                error: `La inspecciÃ³n de inocuidad de la caja ${despacho.placas_caja} estÃ¡ PENDIENTE. RegÃ­strala antes de cerrar.`
             });
         }
 
@@ -810,23 +810,23 @@ const cerrarDespacho = async (req, res) => {
 
         // ---- Fruta de otro cliente ----
         // Se bloquea AL CERRAR, no al agregar: reasignar fruta entre
-        // clientes es legítimo, pero mandar el camión sin que nadie lo haya
-        // notado es lo que cuesta el rechazo en el andén.
+        // clientes es legÃ­timo, pero mandar el camiÃ³n sin que nadie lo haya
+        // notado es lo que cuesta el rechazo en el andÃ©n.
         const descuadres = await despachosModel.getLineasDeOtroCliente(id);
         const confirmado = req.query.confirmar === "1";
 
         if (descuadres.length > 0 && !confirmado) {
             return res.status(409).json({
-                error: `Este despacho lleva ${descuadres.length} línea(s) de fruta planeada para otro cliente. Revísalas y vuelve a cerrar con ?confirmar=1 si la reasignación es correcta.`,
+                error: `Este despacho lleva ${descuadres.length} lÃ­nea(s) de fruta planeada para otro cliente. RevÃ­salas y vuelve a cerrar con ?confirmar=1 si la reasignaciÃ³n es correcta.`,
                 lineas_de_otro_cliente: descuadres
             });
         }
 
-        // El cierre y su auditoría van en UNA transacción, y la
-        // confirmación de reasignación viaja a la BD con
+        // El cierre y su auditorÃ­a van en UNA transacciÃ³n, y la
+        // confirmaciÃ³n de reasignaciÃ³n viaja a la BD con
         // app.confirmar_reasignacion (la exige trg_validar_cierre).
         //
-        // Si se cerró con reasignación, queda constancia en la auditoría:
+        // Si se cerrÃ³ con reasignaciÃ³n, queda constancia en la auditorÃ­a:
         // es exactamente el dato que alguien va a buscar si el CEDIS
         // rechaza la carga.
         await despachosModel.cerrarDespacho(id, {
@@ -838,7 +838,7 @@ const cerrarDespacho = async (req, res) => {
                     cambios: descuadres
                         .map(
                             (d) =>
-                                `Lote ${d.codigo_lote}: planeado para ${d.cliente_fruta} → despachado a ${d.cliente_despacho}`
+                                `Lote ${d.codigo_lote}: planeado para ${d.cliente_fruta} â†’ despachado a ${d.cliente_despacho}`
                         )
                         .join("; "),
                     id_usuario: req.id_usuario
@@ -865,9 +865,9 @@ const cerrarDespacho = async (req, res) => {
 // PATCH /api/preenfrio/despachos/:id/reabrir
 // ----------------------------------------------------------------------------
 // Solo admin, y siempre con motivo: reabrir significa que el documento se
-// cerró por error. Queda registrado en la auditoría.
+// cerrÃ³ por error. Queda registrado en la auditorÃ­a.
 //
-// La inspección se conserva al reabrir. Si se cambia el transporte del
+// La inspecciÃ³n se conserva al reabrir. Si se cambia el transporte del
 // borrador reabierto, la BD la borra y hay que volver a inspeccionar.
 const reabrirDespacho = async (req, res) => {
     try {
@@ -882,7 +882,7 @@ const reabrirDespacho = async (req, res) => {
 
         if (Number(despacho.estado) !== 2) {
             return res.status(409).json({
-                error: "El despacho no está cerrado"
+                error: "El despacho no estÃ¡ cerrado"
             });
         }
 
@@ -892,14 +892,14 @@ const reabrirDespacho = async (req, res) => {
             id_despacho: id,
             estado_al_editar: 2,
             motivo,
-            cambios: "Estado: Cerrado → Borrador",
+            cambios: "Estado: Cerrado â†’ Borrador",
             id_usuario: req.id_usuario
         });
 
         const completo = await despachosModel.getDespachoById(id);
 
         res.status(200).json({
-            mensaje: `Despacho ${completo.folio_despacho} reabierto a borrador. La corrección quedó registrada.`,
+            mensaje: `Despacho ${completo.folio_despacho} reabierto a borrador. La correcciÃ³n quedÃ³ registrada.`,
             despacho: completo
         });
     } catch (error) {
@@ -914,8 +914,8 @@ const reabrirDespacho = async (req, res) => {
 // ----------------------------------------------------------------------------
 // DELETE /api/preenfrio/despachos/:id
 // ----------------------------------------------------------------------------
-// Solo borradores vacíos. Con líneas hay que quitar cada una para devolver
-// la fruta a su cámara.
+// Solo borradores vacÃ­os. Con lÃ­neas hay que quitar cada una para devolver
+// la fruta a su cÃ¡mara.
 const deleteDespacho = async (req, res) => {
     try {
         const { id } = req.params;
@@ -928,13 +928,13 @@ const deleteDespacho = async (req, res) => {
 
         if (Number(despacho.estado) === 2) {
             return res.status(409).json({
-                error: "No se puede eliminar un despacho cerrado: ese camión ya salió."
+                error: "No se puede eliminar un despacho cerrado: ese camiÃ³n ya saliÃ³."
             });
         }
 
         if (Number(despacho.lineas) > 0) {
             return res.status(409).json({
-                error: `El despacho tiene ${despacho.lineas} línea(s) de picking. Quítalas primero para devolver la fruta a sus cámaras.`
+                error: `El despacho tiene ${despacho.lineas} lÃ­nea(s) de picking. QuÃ­talas primero para devolver la fruta a sus cÃ¡maras.`
             });
         }
 
@@ -985,7 +985,7 @@ const getAuditoria = async (req, res) => {
         res.status(200).json(auditoria);
     } catch (error) {
         console.error("Error al obtener la auditoria:", error);
-        res.status(500).json({ error: "Error al obtener la auditoría" });
+        res.status(500).json({ error: "Error al obtener la auditorÃ­a" });
     }
 };
 

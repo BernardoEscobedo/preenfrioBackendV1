@@ -4,61 +4,61 @@ import { db } from "../database/connection.database.js";
 // DESPACHOS
 // ============================================================================
 // El despacho es un DOCUMENTO: folio, transporte, cita y cliente. El picking
-// (qué fruta se sube) vive en despachos_detalle, y puede venir de VARIAS
-// cámaras: por eso se arma desde el documento y no desde cada cámara.
+// (quÃ© fruta se sube) vive en despachos_detalle, y puede venir de VARIAS
+// cÃ¡maras: por eso se arma desde el documento y no desde cada cÃ¡mara.
 //
-// ⚠️ UNA SOLA VÍA DE DESCUENTO
-//   Agregar una línea de picking dispara trg_despacho_detalle_movimiento
-//   (BEFORE INSERT), que genera el movimiento tipo 3. Es ESE movimiento —
-//   con su propio trigger — el que descuenta la cámara.
+// âš ï¸ UNA SOLA VÃA DE DESCUENTO
+//   Agregar una lÃ­nea de picking dispara trg_despacho_detalle_movimiento
+//   (BEFORE INSERT), que genera el movimiento tipo 3. Es ESE movimiento â€”
+//   con su propio trigger â€” el que descuenta la cÃ¡mara.
 //
-//   Quitar una línea borra ese movimiento, y trg_revertir_movimiento (v2.5)
+//   Quitar una lÃ­nea borra ese movimiento, y trg_revertir_movimiento (v2.5)
 //   devuelve la fruta. Este modelo NUNCA escribe en ocupaciones_camaras.
 //
-// ⚠️ LOS TOTALES NO SE CAPTURAN
+// âš ï¸ LOS TOTALES NO SE CAPTURAN
 //   despachos.cantidad_tarimas y cantidad_cajas los mantiene
 //   trg_recalcular_totales_despacho sumando el detalle.
 //
-// ⚠️ INOCUIDAD POR DESPACHO
-//   La inspección de la unidad se guarda en el propio despacho:
-//       inocuidad                NULL pendiente · 0 rechazada · 1 aprobada
+// âš ï¸ INOCUIDAD POR DESPACHO
+//   La inspecciÃ³n de la unidad se guarda en el propio despacho:
+//       inocuidad                NULL pendiente Â· 0 rechazada Â· 1 aprobada
 //       inocuidad_fecha          la pone la BD (trg_validar_cierre)
-//       inocuidad_id_usuario     el usuario de la sesión
+//       inocuidad_id_usuario     el usuario de la sesiÃ³n
 //       inocuidad_observaciones  texto libre
 //
-//   trg_validar_cierre (BEFORE INSERT OR UPDATE) además:
-//     · borra la inspección si cambia el transporte de un borrador
-//     · impide cambiar transporte o inspección de un despacho cerrado
-//     · no deja cerrar sin líneas ni sin inocuidad = 1
-//     · no deja cerrar con fruta de otro cliente salvo que la transacción
+//   trg_validar_cierre (BEFORE INSERT OR UPDATE) ademÃ¡s:
+//     Â· borra la inspecciÃ³n si cambia el transporte de un borrador
+//     Â· impide cambiar transporte o inspecciÃ³n de un despacho cerrado
+//     Â· no deja cerrar sin lÃ­neas ni sin inocuidad = 1
+//     Â· no deja cerrar con fruta de otro cliente salvo que la transacciÃ³n
 //       traiga app.confirmar_reasignacion = '1'
 //
 // ESTADOS
-//   1 = borrador  se puede editar, agregar líneas, inspeccionar y eliminar
-//   2 = cerrado   ya salió; solo admite corrección auditada
+//   1 = borrador  se puede editar, agregar lÃ­neas, inspeccionar y eliminar
+//   2 = cerrado   ya saliÃ³; solo admite correcciÃ³n auditada
 //
-//   NO existe "cancelado" a propósito: un despacho o salió o no salió.
+//   NO existe "cancelado" a propÃ³sito: un despacho o saliÃ³ o no saliÃ³.
 //
-// ALCANCE POR CÁMARA
-//   El documento no tiene cámara — la tienen sus líneas. Un supervisor ve
-//   los despachos que llevan fruta de SUS cámaras, más los borradores
-//   vacíos (que todavía no tienen planta asignada).
+// ALCANCE POR CÃMARA
+//   El documento no tiene cÃ¡mara â€” la tienen sus lÃ­neas. Un supervisor ve
+//   los despachos que llevan fruta de SUS cÃ¡maras, mÃ¡s los borradores
+//   vacÃ­os (que todavÃ­a no tienen planta asignada).
 //
-// CORRECCIÓN DE LA AUDITORÍA
-//   getDisponibleParaPicking no tenía ORDER BY y confiaba en el orden de la
+// CORRECCIÃ“N DE LA AUDITORÃA
+//   getDisponibleParaPicking no tenÃ­a ORDER BY y confiaba en el orden de la
 //   vista. En PostgreSQL, en cuanto se aplica un WHERE sobre una vista, ese
-//   orden deja de estar garantizado: el picking podía dejar de mostrar
-//   primero lo crítico sin que nadie lo notara.
+//   orden deja de estar garantizado: el picking podÃ­a dejar de mostrar
+//   primero lo crÃ­tico sin que nadie lo notara.
 // ============================================================================
 
 // ----------------------------------------------------------------------------
-// Listado — lee vw_despachos
+// Listado â€” lee vw_despachos
 // ----------------------------------------------------------------------------
-// EL FILTRO DE ALCANCE ES POR EXISTENCIA DE LÍNEA
-//   · EXISTS     → alguna de sus líneas sale de una cámara del alcance
-//   · NOT EXISTS → es un borrador todavía sin líneas
+// EL FILTRO DE ALCANCE ES POR EXISTENCIA DE LÃNEA
+//   Â· EXISTS     â†’ alguna de sus lÃ­neas sale de una cÃ¡mara del alcance
+//   Â· NOT EXISTS â†’ es un borrador todavÃ­a sin lÃ­neas
 //
-// ?inocuidad: 1 aprobada · 0 rechazada · 'pendiente' sin inspección
+// ?inocuidad: 1 aprobada Â· 0 rechazada Â· 'pendiente' sin inspecciÃ³n
 const getDespachos = async (
     {
         estado = null,
@@ -119,7 +119,7 @@ const getDespachos = async (
 };
 
 // Un despacho por id, sin filtrar alcance.
-// El controller compara después para distinguir 404 de 403.
+// El controller compara despuÃ©s para distinguir 404 de 403.
 const getDespachoById = async (id_despacho) => {
     const result = await db.query(
         `SELECT * FROM vw_despachos WHERE id_despacho = $1`,
@@ -128,7 +128,7 @@ const getDespachoById = async (id_despacho) => {
     return result.rows[0];
 };
 
-// El picking completo, con la trazabilidad de cada línea.
+// El picking completo, con la trazabilidad de cada lÃ­nea.
 const getDetalle = async (id_despacho) => {
     const result = await db.query(
         `
@@ -145,10 +145,10 @@ const getDetalle = async (id_despacho) => {
 // Alta del documento
 // ----------------------------------------------------------------------------
 // El folio se genera en la BD con fn_generar_folio_despacho(), que consume
-// la secuencia seq_folio_despacho (numeración de negocio desde 70000).
-// Calcularlo con MAX(folio)+1 abriría una ventana de carrera.
+// la secuencia seq_folio_despacho (numeraciÃ³n de negocio desde 70000).
+// Calcularlo con MAX(folio)+1 abrirÃ­a una ventana de carrera.
 //
-// Nace en estado 1 (borrador) y con la inspección PENDIENTE (inocuidad
+// Nace en estado 1 (borrador) y con la inspecciÃ³n PENDIENTE (inocuidad
 // NULL): trg_validar_cierre exige que se cree en borrador.
 const createDespacho = async ({
     id_transporte,
@@ -191,13 +191,13 @@ const createDespacho = async ({
 };
 
 // ----------------------------------------------------------------------------
-// Edición del encabezado
+// EdiciÃ³n del encabezado
 // ----------------------------------------------------------------------------
 // NO toca cantidad_tarimas ni cantidad_cajas: los deriva el trigger.
-// Tampoco el folio, el estado ni la inspección, que tienen su propia vía.
+// Tampoco el folio, el estado ni la inspecciÃ³n, que tienen su propia vÃ­a.
 //
-// ⚠️ Si cambia id_transporte en un borrador, trg_validar_cierre BORRA la
-// inspección: la caja que se revisó ya no es la que va a cargar.
+// âš ï¸ Si cambia id_transporte en un borrador, trg_validar_cierre BORRA la
+// inspecciÃ³n: la caja que se revisÃ³ ya no es la que va a cargar.
 const updateDespacho = async (
     id_despacho,
     {
@@ -245,12 +245,12 @@ const updateDespacho = async (
 };
 
 // ----------------------------------------------------------------------------
-// INSPECCIÓN DE INOCUIDAD
+// INSPECCIÃ“N DE INOCUIDAD
 // ----------------------------------------------------------------------------
 // Solo borradores (estado = 1). La fecha NO se manda: la asigna
-// trg_validar_cierre con CURRENT_TIMESTAMP. El usuario sale de la sesión.
+// trg_validar_cierre con CURRENT_TIMESTAMP. El usuario sale de la sesiÃ³n.
 //
-// Devuelve undefined si el despacho no existe o ya no está en borrador.
+// Devuelve undefined si el despacho no existe o ya no estÃ¡ en borrador.
 const registrarInocuidad = async (
     id_despacho,
     { inocuidad, id_usuario, observaciones }
@@ -270,9 +270,9 @@ const registrarInocuidad = async (
 };
 
 // ----------------------------------------------------------------------------
-// Auditoría (uso interno)
+// AuditorÃ­a (uso interno)
 // ----------------------------------------------------------------------------
-// Recibe el ejecutor (db o un cliente dentro de transacción) para poder
+// Recibe el ejecutor (db o un cliente dentro de transacciÃ³n) para poder
 // registrarse junto con el cierre.
 const insertarAuditoria = async (
     ejecutor,
@@ -292,18 +292,18 @@ const insertarAuditoria = async (
 };
 
 // ----------------------------------------------------------------------------
-// Cerrar: el camión salió.
+// Cerrar: el camiÃ³n saliÃ³.
 // ----------------------------------------------------------------------------
-// Va en TRANSACCIÓN por dos motivos:
+// Va en TRANSACCIÃ“N por dos motivos:
 //
 //   1. trg_validar_cierre rechaza el cierre con fruta de otro cliente salvo
-//      que la MISMA transacción traiga app.confirmar_reasignacion = '1'.
-//      set_config(..., true) solo vive dentro de la transacción: con un
+//      que la MISMA transacciÃ³n traiga app.confirmar_reasignacion = '1'.
+//      set_config(..., true) solo vive dentro de la transacciÃ³n: con un
 //      UPDATE suelto, ?confirmar=1 nunca llegaba a la BD y el cierre
 //      reventaba.
 //
-//   2. Si se cerró con reasignación, la auditoría se guarda en la misma
-//      transacción: o quedan las dos cosas o ninguna.
+//   2. Si se cerrÃ³ con reasignaciÃ³n, la auditorÃ­a se guarda en la misma
+//      transacciÃ³n: o quedan las dos cosas o ninguna.
 const cerrarDespacho = async (
     id_despacho,
     { confirmarReasignacion = false, auditoria = null } = {}
@@ -337,8 +337,8 @@ const cerrarDespacho = async (
     }
 };
 
-// Reabrir a borrador. Solo admin, y siempre con auditoría.
-// La inspección se conserva: la unidad no cambió por reabrir el documento.
+// Reabrir a borrador. Solo admin, y siempre con auditorÃ­a.
+// La inspecciÃ³n se conserva: la unidad no cambiÃ³ por reabrir el documento.
 const reabrirDespacho = async (id_despacho) => {
     const result = await db.query(
         `UPDATE despachos SET estado = 1 WHERE id_despacho = $1 RETURNING *`,
@@ -347,8 +347,8 @@ const reabrirDespacho = async (id_despacho) => {
     return result.rows[0];
 };
 
-// Eliminar el documento. Solo si está en borrador Y sin líneas: con líneas
-// hay que quitarlas primero para devolver la fruta a las cámaras.
+// Eliminar el documento. Solo si estÃ¡ en borrador Y sin lÃ­neas: con lÃ­neas
+// hay que quitarlas primero para devolver la fruta a las cÃ¡maras.
 const deleteDespacho = async (id_despacho) => {
     const result = await db.query(
         `DELETE FROM despachos WHERE id_despacho = $1 RETURNING *`,
@@ -358,11 +358,11 @@ const deleteDespacho = async (id_despacho) => {
 };
 
 // ----------------------------------------------------------------------------
-// PICKING — agregar línea
+// PICKING â€” agregar lÃ­nea
 // ----------------------------------------------------------------------------
-// ⚠️ Este INSERT dispara trg_despacho_detalle_movimiento (BEFORE INSERT),
+// âš ï¸ Este INSERT dispara trg_despacho_detalle_movimiento (BEFORE INSERT),
 // que crea el movimiento tipo 3 y escribe su id en NEW.id_movimiento. Ese
-// movimiento, a su vez, dispara el trigger que descuenta la cámara.
+// movimiento, a su vez, dispara el trigger que descuenta la cÃ¡mara.
 const agregarLinea = async ({
     id_despacho,
     id_produccion,
@@ -400,18 +400,18 @@ const agregarLinea = async ({
 };
 
 // ----------------------------------------------------------------------------
-// PICKING — quitar línea
+// PICKING â€” quitar lÃ­nea
 // ----------------------------------------------------------------------------
-// Llama a fn_quitar_linea_despacho. Desde la v2.5 la función ya no devuelve
+// Llama a fn_quitar_linea_despacho. Desde la v2.5 la funciÃ³n ya no devuelve
 // la fruta por su cuenta: verifica que el despacho siga en borrador, borra
-// la línea y borra el movimiento tipo 3. Ese borrado dispara
-// trg_revertir_movimiento, que devuelve la fruta a su ocupación de origen y
-// la reabre si se había cerrado.
+// la lÃ­nea y borra el movimiento tipo 3. Ese borrado dispara
+// trg_revertir_movimiento, que devuelve la fruta a su ocupaciÃ³n de origen y
+// la reabre si se habÃ­a cerrado.
 //
-// Así hay una sola vía de reversa: si la función también devolviera la
-// fruta, la cámara recuperaría el doble.
+// AsÃ­ hay una sola vÃ­a de reversa: si la funciÃ³n tambiÃ©n devolviera la
+// fruta, la cÃ¡mara recuperarÃ­a el doble.
 //
-// ⚠️ Devuelve TEXTO, no excepción: 'OK: ...' o el motivo del rechazo. El
+// âš ï¸ Devuelve TEXTO, no excepciÃ³n: 'OK: ...' o el motivo del rechazo. El
 // controller lo interpreta.
 const quitarLinea = async (id_detalle) => {
     const result = await db.query(
@@ -432,8 +432,8 @@ const getLineaById = async (id_detalle) => {
 // ----------------------------------------------------------------------------
 // Coherencia del picking contra el documento
 // ----------------------------------------------------------------------------
-// Líneas cuyo cliente NO coincide con el del despacho: subir al camión de
-// Walmart fruta planeada para Chedraui. El CEDIS la rechaza en el andén o
+// LÃ­neas cuyo cliente NO coincide con el del despacho: subir al camiÃ³n de
+// Walmart fruta planeada para Chedraui. El CEDIS la rechaza en el andÃ©n o
 // se factura mal.
 const getLineasDeOtroCliente = async (id_despacho) => {
     const result = await db.query(
@@ -460,7 +460,7 @@ const getLineasDeOtroCliente = async (id_despacho) => {
     return result.rows;
 };
 
-// Cámaras que aportaron fruta a este despacho. El controller la usa para
+// CÃ¡maras que aportaron fruta a este despacho. El controller la usa para
 // validar el alcance sobre un documento que ya tiene picking.
 const getCamarasDelDespacho = async (id_despacho) => {
     const result = await db.query(
@@ -475,10 +475,10 @@ const getCamarasDelDespacho = async (id_despacho) => {
 };
 
 // ----------------------------------------------------------------------------
-// AUDITORÍA
+// AUDITORÃA
 // ----------------------------------------------------------------------------
-// Un despacho cerrado no se elimina, pero sí admite corregir datos
-// administrativos. Cada corrección exige motivo y queda registrada.
+// Un despacho cerrado no se elimina, pero sÃ­ admite corregir datos
+// administrativos. Cada correcciÃ³n exige motivo y queda registrada.
 const registrarAuditoria = async (datos) => insertarAuditoria(db, datos);
 
 const getAuditoria = async (id_despacho) => {
@@ -494,10 +494,10 @@ const getAuditoria = async (id_despacho) => {
 };
 
 // ----------------------------------------------------------------------------
-// Clientes con fruta disponible — dropdown del picking
+// Clientes con fruta disponible â€” dropdown del picking
 // ----------------------------------------------------------------------------
-// ⚠️ No se usa vw_clientes_con_inventario directo: esa vista agrega TODO el
-// inventario y ofrecería clientes cuya fruta está en otra planta. Se
+// âš ï¸ No se usa vw_clientes_con_inventario directo: esa vista agrega TODO el
+// inventario y ofrecerÃ­a clientes cuya fruta estÃ¡ en otra planta. Se
 // recalcula el agregado con el filtro de alcance aplicado.
 const getClientesConInventario = async (camaras = null) => {
     const result = await db.query(
@@ -526,8 +526,8 @@ const getClientesConInventario = async (camaras = null) => {
 };
 
 // Fruta disponible para armar el picking.
-// Criticidad y luego FEFO (v2.3): lo que está más cerca de incumplir su cita
-// aparece primero. El ORDER BY va explícito: el de la vista deja de estar
+// Criticidad y luego FEFO (v2.3): lo que estÃ¡ mÃ¡s cerca de incumplir su cita
+// aparece primero. El ORDER BY va explÃ­cito: el de la vista deja de estar
 // garantizado en cuanto se aplica el WHERE.
 const getDisponibleParaPicking = async (id_cc, camaras = null) => {
     const result = await db.query(
