@@ -3,14 +3,14 @@ import { aFechaISO, esFechaFutura } from "../utils/fechas.js";
 // ============================================================================
 // VALIDACIONES · DESPACHO EN UN PASO
 // ============================================================================
-// Forma del body y normalización. Lo que exige la BD (stock, duplicados,
-// estado de las piezas) lo valida el controller dentro de la transacción.
+// Forma del body y normalización. Lo que exige la BD (tarimas disponibles,
+// stock, duplicados) lo valida el controller dentro de la transacción.
 //
 // body:
 // {
 //   id_cc, fecha_despacho, hora_salida, orden_venta?, cita?, fecha_cita?,
 //   temperatura_salida?, observaciones?, confirmar_reasignacion?,
-//   lineas: [{ id_ocupacion_origen, cantidad_tarimas, cantidad_cajas }],
+//   id_tarimas: [id_tarima, ...]        tarimas de bloque que suben
 //   transporte: {
 //     id_linea_fletera,
 //     operador:     { id } | { nuevo: { nombre, celular } },
@@ -20,9 +20,12 @@ import { aFechaISO, esFechaFutura } from "../utils/fechas.js";
 //   },
 //   inspeccion: [{ inocuidad: 1, observaciones? }]   una por caja
 // }
+//
+// La fruta sale por TARIMA de bloque, entera (completa, media o mixta).
 // ============================================================================
 
 const HORA = /^([01]\d|2[0-3]):([0-5]\d)(:([0-5]\d))?$/;
+const MAX_TARIMAS = 60;
 const entero = (v) => Number.isInteger(Number(v)) && Number(v) > 0;
 const texto = (v) => (v === undefined || v === null ? "" : String(v).trim());
 const placa = (v) => texto(v).toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -76,7 +79,6 @@ export const validarDespachoCompleto = (req, res, next) => {
 
     const fecha = b.fecha_despacho ? aFechaISO(b.fecha_despacho) : null;
     if (!fecha) return error(res, "La fecha de despacho es obligatoria (AAAA-MM-DD)");
-    // Se confirma cuando el camión sale: no puede ser futura
     if (esFechaFutura(fecha)) return error(res, "La fecha de despacho no puede ser futura: se confirma cuando el camión sale");
 
     if (!b.hora_salida || !HORA.test(String(b.hora_salida))) return error(res, "La hora de salida es obligatoria (HH:MM)");
@@ -98,26 +100,11 @@ export const validarDespachoCompleto = (req, res, next) => {
     if (texto(b.cita).length > 50) return error(res, "La cita no puede exceder 50 caracteres");
     if (texto(b.observaciones).length > 250) return error(res, "Las observaciones no pueden exceder 250 caracteres");
 
-    // ---- Fruta ----
-    if (!Array.isArray(b.lineas) || b.lineas.length === 0) return error(res, "Elige al menos un proceso a despachar");
-    if (b.lineas.length > 100) return error(res, "Máximo 100 procesos por despacho");
-
-    const vistos = new Set();
-    const lineas = [];
-    for (const [i, l] of b.lineas.entries()) {
-        if (!l || !entero(l.id_ocupacion_origen)) return error(res, `Proceso ${i + 1}: origen inválido`);
-        const id = Number(l.id_ocupacion_origen);
-        if (vistos.has(id)) return error(res, `Proceso ${i + 1}: viene repetido`);
-        vistos.add(id);
-        const tar = Number(l.cantidad_tarimas ?? 0);
-        const caj = Number(l.cantidad_cajas ?? 0);
-        if (!Number.isInteger(tar) || tar < 0 || !Number.isInteger(caj) || caj < 0)
-            return error(res, `Proceso ${i + 1}: tarimas y cajas deben ser enteros`);
-        if (tar === 0 && caj === 0) return error(res, `Proceso ${i + 1}: indica cuánto sale`);
-        if (tar > 0 && caj > 0 && tar > caj) return error(res, `Proceso ${i + 1}: ${tar} tarimas con ${caj} cajas no es posible`);
-        if (tar > 0 && caj > tar * 60) return error(res, `Proceso ${i + 1}: ${caj} cajas no caben en ${tar} tarimas`);
-        lineas.push({ id_ocupacion_origen: id, cantidad_tarimas: tar, cantidad_cajas: caj });
-    }
+    // ---- Tarimas ----
+    if (!Array.isArray(b.id_tarimas) || b.id_tarimas.length === 0) return error(res, "Elige al menos una tarima");
+    const tarimas = [...new Set(b.id_tarimas.map(Number))];
+    if (tarimas.some((x) => !Number.isInteger(x) || x <= 0)) return error(res, "Tarimas inválidas");
+    if (tarimas.length > MAX_TARIMAS) return error(res, `Máximo ${MAX_TARIMAS} tarimas por despacho`);
 
     // ---- Transporte ----
     const t = b.transporte;
@@ -168,7 +155,7 @@ export const validarDespachoCompleto = (req, res, next) => {
         temperatura_salida: temp,
         observaciones: texto(b.observaciones) || null,
         confirmar_reasignacion: b.confirmar_reasignacion === true,
-        lineas,
+        id_tarimas: tarimas,
         transporte: {
             id_linea_fletera: Number(t.id_linea_fletera),
             operador,
