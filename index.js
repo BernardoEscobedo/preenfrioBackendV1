@@ -59,6 +59,7 @@ import produccionImportacionRouter from "./routes/produccionImportacion.route.js
 import tarimasRouter from "./routes/tarimas.route.js";
 import { middlewareActivarProgramados, iniciarActivadorProgramados } from "./utils/mantenimientosProgramados.js";
 import temporalesRouter from "./routes/temporales.route.js";
+import packingRouter from "./routes/packing.route.js";
 
 // ============================================================================
 // VERIFICACIÓN DE ARRANQUE
@@ -148,6 +149,7 @@ app.use(`${API}/produccion-importacion`, produccionImportacionRouter);
 app.use(`${API}/tarimas`, tarimasRouter);
 app.use(API, middlewareActivarProgramados);
 app.use(`${API}/temporales`, temporalesRouter);
+app.use(`${API}/packing`, packingRouter);
 
 // ---- v3.0 ----
 // Fotos y videos de despachos y pulpeos, almacenados en SharePoint
